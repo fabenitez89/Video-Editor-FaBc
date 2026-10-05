@@ -1,0 +1,753 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Showreel</title>
+<style>
+  @font-face { font-family: 'Display'; src: url(fonts/archivo-900.woff2) format('woff2'); font-weight: 900; }
+  @font-face { font-family: 'UI'; src: url(fonts/jetbrains-mono-500.woff2) format('woff2'); font-weight: 500; }
+  html, body { margin: 0; background: #0f0f0d; }
+  canvas { display: block; width: 100vw; height: auto; }
+</style>
+<script src="beats.js"></script>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Showreel: 15 s, one accent square threading eight scenes, cut to the measured 120 BPM grid.
+// Pure function of time: seek(t) paints frame t from scratch.
+const W = 1920, H = 1080;
+window.DURATION = 15;
+
+const INK = '#0f0f0d', PAPER = '#f2eee6', ACCENT = '#ff4f1f', GRAY = '#57534b', GRAY2='#b3ada1';
+const P = window.BEATS?.period ?? 0.5;
+const O = window.BEATS?.offset ?? 0;
+const beatTime = (b) => O + b * P;
+
+// ---- math ---------------------------------------------------------------------
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, x) => a + (b - a) * x;
+const prog = (x, a, b) => clamp((x - a) / (b - a));
+const E = {
+  linear: (x) => x,
+  expoOut: (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x)),
+  expoIn: (x) => (x <= 0 ? 0 : Math.pow(2, 10 * x - 10)),
+  expoInOut: (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x < 0.5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2),
+  cubicInOut: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+  backOut: (x, s = 1.8) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2),
+  spring: (x, k = 18, z = 0.32) => (x <= 0 ? 0 : 1 - Math.exp(-z * k * x) * Math.cos(k * Math.sqrt(1 - z * z) * x)),
+};
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const NOISE = (() => { const r = mulberry32(7); return Array.from({ length: 512 }, () => r() * 2 - 1); })();
+function noise1(x) {
+  const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f);
+  return lerp(NOISE[((i % 512) + 512) % 512], NOISE[(((i + 1) % 512) + 512) % 512], s);
+}
+
+// ---- type -------------------------------------------------------------------------
+function font(ctx, size, ui = false) { ctx.font = ui ? `500 ${size}px UI` : `900 ${size}px Display`; }
+const layoutCache = new Map();
+function layout(ctx, word, size, ui = false, track = -0.02) {
+  const key = `${word}|${size}|${ui}|${track}`;
+  if (layoutCache.has(key)) return layoutCache.get(key);
+  font(ctx, size, ui);
+  let x = 0;
+  const letters = [];
+  for (const ch of word) {
+    const w = ctx.measureText(ch).width;
+    letters.push({ ch, x, w });
+    x += w + track * size;
+  }
+  const capH = ctx.measureText('H').actualBoundingBoxAscent;
+  const out = { letters, width: x - track * size, capH };
+  layoutCache.set(key, out);
+  return out;
+}
+function sizeToWidth(ctx, word, width, ui = false) {
+  const l = layout(ctx, word, 100, ui);
+  return (100 * width) / l.width;
+}
+function typed(text, p) { return text.slice(0, Math.floor(text.length * clamp(p) + 1e-6)); }
+
+// ---- the square -----------------------------------------------------------------
+// keys: landings {b, x, y, h}; y is the ground under the square, h the arc height into that landing.
+function hop(keys, b) {
+  const first = keys[0];
+  if (b < first.b) {
+    const p = clamp(1 - (first.b - b) / 0.5);
+    return { x: first.x, y: lerp(first.y - 1300, first.y, p * p), vy: (2 * p * 1300) / (0.5 * P), since: -1, rot: 0 };
+  }
+  for (let i = 1; i < keys.length; i++) {
+    const a = keys[i - 1], c = keys[i];
+    if (b < c.b) {
+      const p = (b - a.b) / (c.b - a.b);
+      const dur = (c.b - a.b) * P;
+      return {
+        x: lerp(a.x, c.x, p),
+        y: lerp(a.y, c.y, p) - c.h * 4 * p * (1 - p),
+        vy: ((c.y - a.y) - c.h * 4 * (1 - 2 * p)) / dur,
+        since: (b - a.b) * P,
+        rot: 90 * E.cubicInOut(p) * Math.sign(c.x - a.x),
+      };
+    }
+  }
+  const last = keys[keys.length - 1];
+  return { x: last.x, y: last.y, vy: 0, since: (b - last.b) * P, rot: 0 };
+}
+function drawSquare(ctx, s, size, color = ACCENT) {
+  const squash = s.since < 0 ? 0 : 0.42 * Math.exp(-s.since * 11) * Math.cos(s.since * 32);
+  const stretch = clamp(Math.abs(s.vy) / 3200) * 0.35;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.scale(1 + squash * 0.9 - stretch * 0.5, 1 - squash + stretch);
+  ctx.translate(0, -size / 2);
+  ctx.rotate((s.rot * Math.PI) / 180);
+  ctx.fillStyle = color;
+  ctx.fillRect(-size / 2, -size / 2, size, size);
+  ctx.restore();
+}
+
+// ---- scene A: MOVE (beats 0-4) ------------------------------------------------------
+const FLOOR = 700;
+const SQ = 110;
+let geo = null;
+function geometry(ctx) {
+  if (geo) return geo;
+  const size = sizeToWidth(ctx, 'MOVE', 2040);
+  const l = layout(ctx, 'MOVE', size);
+  const x0 = -60, base = 860;
+  const tops = l.letters.map((g) => ({ cx: x0 + g.x + g.w / 2, top: base - l.capH }));
+  const keys = [
+    { b: 1.0, x: tops[0].cx, y: tops[0].top, h: 0 },
+    { b: 1.5, x: tops[1].cx, y: tops[1].top, h: 130 },
+    { b: 2.0, x: tops[2].cx, y: tops[2].top, h: 130 },
+    { b: 2.5, x: tops[3].cx, y: tops[3].top, h: 130 },
+    { b: 4.0, x: 260, y: FLOOR, h: 430 },
+    { b: 5.0, x: 700, y: FLOOR, h: 380 },
+    { b: 6.0, x: 1140, y: FLOOR, h: 380 },
+    { b: 7.0, x: 1580, y: FLOOR, h: 380 },
+  ];
+  geo = { size, l, x0, base, keys };
+  return geo;
+}
+
+function drawMove(ctx, b, g) {
+  const { size, l, x0, base } = g;
+  font(ctx, size);
+  ctx.fillStyle = PAPER;
+  l.letters.forEach((le, k) => {
+    const p = E.expoOut(prog(b, k * 0.5, k * 0.5 + 0.5));
+    if (p <= 0) return;
+    const hitB = 1.0 + 0.5 * k;
+    const dt = (b - hitB) * P;
+    const dip = dt >= 0 ? 34 * Math.exp(-dt * 9) * Math.cos(dt * 26) : 0;
+    ctx.save();
+    ctx.translate(x0 + le.x, base + dip);
+    if (k === 0) {
+      ctx.beginPath(); ctx.rect(-50, -l.capH - 60, le.w + 100, l.capH + 60); ctx.clip();
+      ctx.translate(0, (1 - p) * l.capH * 1.15);
+    } else if (k === 1) {
+      const s = E.backOut(prog(b, 0.5, 1.0), 2.2);
+      ctx.translate(le.w / 2, -l.capH / 2);
+      ctx.rotate((1 - s) * -1.4);
+      ctx.scale(s, s);
+      ctx.translate(-le.w / 2, l.capH / 2);
+    } else if (k === 2) {
+      const land = (b - 1.5) * P;
+      const sq = land >= 0 ? 0.22 * Math.exp(-land * 12) * Math.cos(land * 30) : 0;
+      ctx.translate(0, -(1 - p) * 1100);
+      ctx.translate(le.w / 2, 0); ctx.scale(1 + sq * 0.6, 1 - sq); ctx.translate(-le.w / 2, 0);
+    } else {
+      ctx.translate((1 - p) * 1300, 0);
+      ctx.transform(1, 0, -0.45 * (1 - p), 1, 0, 0);
+    }
+    ctx.fillText(le.ch, 0, 0);
+    ctx.restore();
+  });
+}
+
+function sceneA(ctx, b) {
+  const g = geometry(ctx);
+  const strips = 7;
+  const top = g.base - g.l.capH - 80, h = g.l.capH + 120;
+  if (b < 3) {
+    drawMove(ctx, b, g);
+  } else {
+    for (let i = 0; i < strips; i++) {
+      const p = E.expoIn(prog(b, 3.0 + i * 0.05, 3.6 + i * 0.05));
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, top + (h / strips) * i, W, h / strips + 1); ctx.clip();
+      ctx.translate((i % 2 ? 1 : -1) * p * 2300, 0);
+      drawMove(ctx, b, g);
+      ctx.restore();
+    }
+  }
+  if (b > 3.5) drawFloor(ctx, b);
+  drawSquare(ctx, hop(g.keys, b), SQ);
+}
+
+// ---- scene B: principles (beats 4-8) ----------------------------------------------------
+const PRINCIPLES = ['TIMING', 'WEIGHT', 'SPACING', 'ARCS'];
+function drawFloor(ctx, b) {
+  const p = E.expoOut(prog(b, 3.6, 4.3));
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(0, FLOOR, W * p, 3);
+}
+function sceneB(ctx, b) {
+  const g = geometry(ctx);
+  const lb = b - 4;
+  drawFloor(ctx, b);
+
+  // Trajectory: dots trace where the square has been since it reached the floor.
+  ctx.fillStyle = GRAY2;
+  for (let s = 4.02; s < Math.min(b, 7.0); s += 0.045) {
+    const st = hop(g.keys, s);
+    ctx.fillRect(st.x - 3, st.y - SQ / 2 - 3, 6, 6);
+  }
+
+  // Each landing rolls the next principle up from under the floor.
+  const size = 200, top = FLOOR + 40;
+  const l0 = layout(ctx, 'H', size);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, FLOOR + 6, W, 260); ctx.clip();
+  font(ctx, size);
+  ctx.fillStyle = PAPER;
+  for (let k = 0; k < 4; k++) {
+    const pin = E.expoOut(prog(lb, k, k + 0.4));
+    const pout = k < 3 ? E.expoOut(prog(lb, k + 1, k + 1.4)) : 0;
+    if (pin <= 0 || pout >= 1) continue;
+    const y = top + l0.capH - (1 - pin) * 260 + pout * 260;
+    ctx.fillText(PRINCIPLES[k], 160, y);
+  }
+  ctx.restore();
+  const k = clamp(Math.floor(lb), 0, 3);
+  font(ctx, 40, true);
+  ctx.fillStyle = GRAY2;
+  ctx.fillText(`0${k + 1} / 04  principles of animation`, 166, FLOOR + 310);
+
+  // Exit: the square launches toward the lens and becomes the next frame.
+  const z = E.expoIn(prog(lb, 3.35, 4.0));
+  const st = hop(g.keys, b);
+  if (z > 0) {
+    const size2 = SQ * (1 + z * 40);
+    ctx.save();
+    ctx.translate(st.x, st.y - SQ / 2 - z * 60);
+    ctx.rotate(z * Math.PI / 4);
+    ctx.fillStyle = ACCENT;
+    ctx.fillRect(-size2 / 2, -size2 / 2, size2, size2);
+    ctx.restore();
+  } else {
+    drawSquare(ctx, st, SQ);
+  }
+}
+
+// ---- scene C: grid (beats 8-12) ---------------------------------------------------------
+const COLS = 16, ROWS = 9, CELL = 120;
+const ORIGIN = { x: 1580, y: FLOOR - SQ / 2 };
+const PULSES = (() => {
+  const r = mulberry32(42);
+  return [1, 2, 3].map((at) => ({ at, x: 200 + r() * 1520, y: 150 + r() * 780 }));
+})();
+const TILE_JITTER = (() => { const r = mulberry32(3); return Array.from({ length: COLS * ROWS }, () => r()); })();
+const TRACKS = [360, 540, 720];
+const TRACK_X0 = 560, TRACK_X1 = 1760;
+
+function sceneC(ctx, b) {
+  const lb = b - 8;
+  if (lb < 0.08) { ctx.fillStyle = ACCENT; ctx.fillRect(0, 0, W, H); return; }
+  const round = E.expoOut(prog(lb, 2, 2.5)) * (1 - E.expoOut(prog(lb, 3, 3.5)));
+  const diamond = E.expoOut(prog(lb, 3, 3.5));
+  for (let j = 0; j < ROWS; j++) {
+    for (let i = 0; i < COLS; i++) {
+      const cx = CELL / 2 + i * CELL, cy = CELL / 2 + j * CELL;
+      const d = Math.hypot(cx - ORIGIN.x, cy - ORIGIN.y);
+      const delay = (d / 2200) * 0.7;
+      const p = E.expoOut(prog(lb, 0.08 + delay, 0.75 + delay));
+      let size = lerp(CELL + 1, 34, p);
+      let rot = diamond * Math.PI / 4;
+      let ripple = 0;
+      for (const pu of PULSES) {
+        const dt = lb - pu.at;
+        if (dt < 0) continue;
+        const dd = Math.hypot(cx - pu.x, cy - pu.y);
+        ripple += Math.exp(-(((dd - dt * 2400) / 240) ** 2)) * Math.exp(-dt * 0.7);
+      }
+      size += ripple * 86;
+      rot += ripple * Math.PI / 2;
+      const flip = Math.abs(Math.cos(p * Math.PI));
+      let color = p < 0.5 || ripple > 0.25 ? ACCENT : PAPER;
+
+      // Exit: tiles collapse onto the three easing tracks.
+      const e = E.expoInOut(prog(lb, 3.4 + TILE_JITTER[j * COLS + i] * 0.15, 3.97));
+      const ty = TRACKS.reduce((best, y) => (Math.abs(y - cy) < Math.abs(best - cy) ? y : best));
+      const inSpan = cx > TRACK_X0 && cx < TRACK_X1;
+      const w = lerp(size * (p < 1 ? flip : 1), inSpan ? CELL + 1 : 0, e);
+      const h = lerp(size, 4, e);
+      const y = lerp(cy, ty + 2, e);
+      if (e > 0.5) color = GRAY;
+      rot *= 1 - e;
+      const r = round * Math.min(w, h) / 2 * (1 - e);
+
+      ctx.save();
+      ctx.translate(cx, y);
+      ctx.rotate(rot);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.roundRect(-w / 2, -h / 2, w, h, r);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+// ---- scene D: easing (beats 12-16) --------------------------------------------------------
+const CURVES = [
+  { name: 'linear', f: E.linear },
+  { name: 'expo.out', f: E.expoOut },
+  { name: 'spring  k=180  ζ=0.32', f: (x) => E.spring(x) },
+];
+function moveState(lb) {
+  // Moves start on each beat; direction alternates.
+  const k = clamp(Math.floor(lb), 0, 3);
+  const p = prog(lb, k + 0.02, k + 0.92);
+  return { k, p, dir: k % 2 === 0 ? 1 : -1 };
+}
+function sceneD(ctx, b) {
+  const lb = b - 12;
+  const { k, p, dir } = moveState(lb);
+  const retract = E.expoIn(prog(lb, 3.3, 3.75));
+  const converge = E.expoIn(prog(lb, 3.45, 4.0));
+
+  CURVES.forEach((c, i) => {
+    const y = TRACKS[i];
+    // Track line, retracting left to right on exit.
+    ctx.fillStyle = GRAY;
+    const x0 = lerp(TRACK_X0, TRACK_X1, retract);
+    ctx.fillRect(x0, y, TRACK_X1 - x0, 4);
+    if (lb < 3.5) {
+      font(ctx, 40, true);
+      ctx.fillStyle = GRAY2;
+      ctx.fillText(typed(c.name, prog(lb, 0.1, 0.8)), TRACK_X0, y - 38);
+
+      // Mini graph of the curve, drawn as far as the current move.
+      const gx = 140, gy = y + 66, gw = 320, gh = 132;
+      ctx.fillStyle = GRAY;
+      ctx.fillRect(gx, gy, gw, 2);
+      ctx.fillRect(gx, gy - gh, 2, gh);
+      ctx.strokeStyle = PAPER; ctx.lineWidth = 3;
+      ctx.beginPath();
+      for (let s = 0; s <= 60 * p; s++) {
+        const x = s / 60;
+        const yy = gy - c.f(x) * gh;
+        s === 0 ? ctx.moveTo(gx + x * gw, yy) : ctx.lineTo(gx + x * gw, yy);
+      }
+      ctx.stroke();
+      ctx.fillStyle = ACCENT;
+      ctx.fillRect(gx + p * gw - 6, gy - c.f(p) * gh - 6, 12, 12);
+
+      // Onion skin: ticks at even time steps make the spacing visible.
+      ctx.fillStyle = PAPER;
+      for (let m = 0; m <= 12; m++) {
+        if (m / 12 > p) break;
+        const xm = dir > 0 ? lerp(TRACK_X0, TRACK_X1, c.f(m / 12)) : lerp(TRACK_X1, TRACK_X0, c.f(m / 12));
+        ctx.fillRect(xm - 1, y - 12, 3, 28);
+      }
+    }
+    const x = dir > 0 ? lerp(TRACK_X0, TRACK_X1, c.f(p)) : lerp(TRACK_X1, TRACK_X0, c.f(p));
+    const pop = E.backOut(prog(lb, 0, 0.3));
+    const dx = lerp(x, W / 2, converge), dy = lerp(y + 2, H / 2, converge);
+    ctx.fillStyle = ACCENT;
+    ctx.beginPath(); ctx.arc(dx, dy, 22 * pop, 0, TAU); ctx.fill();
+  });
+}
+
+// ---- scene E: dimension (beats 16-20) --------------------------------------------------------
+const FOCAL = 1600;
+const CUBE = 320;
+function rotX(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]; }
+function rotY(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]; }
+function rotZ(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2]]; }
+function project(v) { const s = FOCAL / (FOCAL + v[2]); return [W / 2 + v[0] * s, H / 2 + v[1] * s, s]; }
+function mix(a, b, x) {
+  const pa = [1, 3, 5].map((i) => parseInt(a.slice(i, i + 2), 16));
+  const pb = [1, 3, 5].map((i) => parseInt(b.slice(i, i + 2), 16));
+  return `rgb(${pa.map((v, i) => Math.round(lerp(v, pb[i], clamp(x)))).join(',')})`;
+}
+const FACES = [
+  [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]],
+  [[1, -1, 1], [-1, -1, 1], [-1, 1, 1], [1, 1, 1]],
+  [[-1, -1, 1], [-1, -1, -1], [-1, 1, -1], [-1, 1, 1]],
+  [[1, -1, -1], [1, -1, 1], [1, 1, 1], [1, 1, -1]],
+  [[-1, -1, 1], [1, -1, 1], [1, -1, -1], [-1, -1, -1]],
+  [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]],
+];
+const LIGHT = (() => { const v = [0.35, 0.45, 1]; const m = Math.hypot(...v); return v.map((x) => x / m); })();
+function cubeRotation(lb) {
+  const kick = (k) => E.expoOut(prog(lb, k, k + 0.6)) * Math.PI / 2;
+  const env = E.expoOut(prog(lb, 0, 0.6)) * (1 - E.expoInOut(prog(lb, 3.0, 3.9)));
+  return { kx: kick(1) + kick(3), ky: kick(0) + kick(2), tx: 0.45 * env, ty: 0.6 * env };
+}
+function drawCube(ctx, lb, size) {
+  const r = cubeRotation(lb);
+  const tf = (v) => rotY(rotX(rotY(rotX(v.map((c) => (c * size) / 2), r.kx), r.ky), r.tx), r.ty);
+  const faces = FACES.map((f) => {
+    const pts = f.map(tf);
+    const a = pts[0], b2 = pts[1], c = pts[2];
+    const u = [b2[0] - a[0], b2[1] - a[1], b2[2] - a[2]], v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    const nm = Math.hypot(...n) || 1;
+    const light = -(n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2]) / nm;
+    const proj = pts.map(project);
+    const area = proj.reduce((s, p, i) => { const q = proj[(i + 1) % 4]; return s + (p[0] * q[1] - q[0] * p[1]); }, 0);
+    return { proj, light, z: pts.reduce((s, p) => s + p[2], 0) / 4, area };
+  }).filter((f) => f.area < 0).sort((a, b2) => b2.z - a.z);
+  for (const f of faces) {
+    ctx.fillStyle = mix(INK, ACCENT, 0.35 + 0.75 * Math.max(0, f.light));
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    f.proj.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+}
+const RINGS = [
+  { text: 'MOTION DESIGN · KINETIC TYPE · ', size: 64, ui: false, R: 640, tilt: 0.26, roll: -0.12, speed: 0.55, dir: 1 },
+  { text: '3D · DEPTH · CAMERA · RHYTHM · SYSTEMS · ', size: 40, ui: true, R: 480, tilt: -0.34, roll: 0.16, speed: 0.8, dir: -1 },
+];
+function ringGlyphs(ctx, ring, lb) {
+  const l = layout(ctx, ring.text, ring.size, ring.ui, 0);
+  const reps = Math.max(1, Math.round((TAU * ring.R) / l.width));
+  const scale = (TAU * ring.R) / (reps * l.width);
+  const fly = E.expoIn(prog(lb, 3.25, 4.0));
+  const R = ring.R * (1 + fly * 2.6);
+  const kicks = [0, 1, 2, 3].reduce((s, k) => s + E.expoOut(prog(lb, k, k + 0.5)), 0);
+  const spin = ring.dir * (lb * ring.speed + kicks * 0.35);
+  const reveal = E.expoOut(prog(lb, 0.05, 1.1));
+  const out = [];
+  const total = reps * l.letters.length;
+  for (let r = 0; r < reps; r++) {
+    l.letters.forEach((le, i) => {
+      const idx = r * l.letters.length + i;
+      if (idx / total > reveal) return;
+      const theta = ((r * l.width + le.x + le.w / 2) * scale) / ring.R + spin;
+      const local = [R * Math.sin(theta), 0, -R * Math.cos(theta)];
+      const v = rotZ(rotX(local, ring.tilt), ring.roll);
+      const [x, y, s] = project(v);
+      out.push({ ch: le.ch, x, y, s, face: Math.cos(theta), z: v[2], w: le.w });
+    });
+  }
+  return out;
+}
+function drawGlyphs(ctx, ring, glyphs, front) {
+  font(ctx, ring.size, ring.ui);
+  ctx.fillStyle = front ? PAPER : GRAY;
+  for (const gl of glyphs) {
+    if ((gl.z < 0) !== front) continue;
+    ctx.save();
+    ctx.translate(gl.x, gl.y);
+    ctx.rotate(ring.roll);
+    ctx.scale(gl.face * gl.s, gl.s);
+    ctx.fillText(gl.ch, -gl.w / 2, ring.size * 0.35);
+    ctx.restore();
+  }
+}
+function sceneE(ctx, b) {
+  const lb = b - 16;
+  const dolly = lerp(1, 1.07, E.cubicInOut(prog(lb, 0, 3.2))) * (1 - E.expoIn(prog(lb, 3.2, 4)) * 0.07);
+  ctx.save();
+  ctx.translate(W / 2, H / 2); ctx.scale(dolly, dolly); ctx.translate(-W / 2, -H / 2);
+  const glyphs = RINGS.map((r) => ringGlyphs(ctx, r, lb));
+  RINGS.forEach((r, i) => drawGlyphs(ctx, r, glyphs[i], false));
+  const size = lerp(44 * 0.35, CUBE, E.backOut(prog(lb, 0, 0.6), 1.4));
+  drawCube(ctx, lb, size);
+  RINGS.forEach((r, i) => drawGlyphs(ctx, r, glyphs[i], true));
+  ctx.restore();
+}
+
+// ---- scene F: morph (beats 20-24) ----------------------------------------------------------
+const NPTS = 240;
+function resample(verts) {
+  const segs = verts.map((v, i) => { const w = verts[(i + 1) % verts.length]; return { v, w, len: Math.hypot(w[0] - v[0], w[1] - v[1]) }; });
+  const total = segs.reduce((s, sg) => s + sg.len, 0);
+  const pts = [];
+  let si = 0, acc = 0;
+  for (let k = 0; k < NPTS; k++) {
+    const d = (k / NPTS) * total;
+    while (acc + segs[si].len < d) { acc += segs[si].len; si++; }
+    const f = (d - acc) / segs[si].len;
+    pts.push([lerp(segs[si].v[0], segs[si].w[0], f), lerp(segs[si].v[1], segs[si].w[1], f)]);
+  }
+  return pts;
+}
+function polar(n, radii) {
+  return Array.from({ length: n }, (_, i) => {
+    const a = -Math.PI / 2 + (i / n) * TAU;
+    const r = radii[i % radii.length];
+    return [r * Math.cos(a), r * Math.sin(a)];
+  });
+}
+// Front face of the cube when it settles face-on, so the cut is invisible.
+const FACE_SIDE = (CUBE * FOCAL) / (FOCAL - CUBE / 2);
+const SHAPES = [
+  resample([[0, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [-0.5, -0.5]]),
+  resample(polar(NPTS, [0.58])),
+  resample(polar(3, [0.72])),
+  resample(polar(10, [0.74, 0.31])),
+];
+const WORDS_F = ['SHAPE', 'SHIFT', 'SNAP', 'SPIN'];
+function morphAt(lb) {
+  let pts = SHAPES[0], rot = 0;
+  for (let k = 1; k < SHAPES.length; k++) {
+    const p = E.expoOut(prog(lb, k - 1, k - 0.45));
+    if (p <= 0) break;
+    pts = pts.map((q, i) => [lerp(q[0], SHAPES[k][i][0], p), lerp(q[1], SHAPES[k][i][1], p)]);
+    rot += p * Math.PI / 3;
+  }
+  rot += E.expoOut(prog(lb, 3, 3.6)) * Math.PI * 0.4;
+  rot += E.expoIn(prog(lb, 3.4, 4.0)) * Math.PI;
+  const move = E.expoInOut(prog(lb, 0, 0.6));
+  const size = lerp(FACE_SIDE, 440, move) * (1 + E.expoIn(prog(lb, 3.4, 4.0)) * 14);
+  return { pts, rot, size, x: lerp(W / 2, 1300, move), y: H / 2 };
+}
+function shapePath(ctx, m) {
+  ctx.beginPath();
+  m.pts.forEach((q, i) => {
+    const c = Math.cos(m.rot), s = Math.sin(m.rot);
+    const x = m.x + (q[0] * c - q[1] * s) * m.size, y = m.y + (q[0] * s + q[1] * c) * m.size;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.closePath();
+}
+function sceneF(ctx, b) {
+  const lb = b - 20;
+  // Echoes trail the morph and close up when the shape rests.
+  for (let e = 5; e >= 1; e--) {
+    ctx.strokeStyle = PAPER; ctx.globalAlpha = 0.55 * (1 - e / 6); ctx.lineWidth = 3;
+    shapePath(ctx, morphAt(lb - e * 0.07));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = ACCENT;
+  shapePath(ctx, morphAt(lb));
+  ctx.fill();
+
+  const size = 210, base = 600;
+  const cap = layout(ctx, 'H', size).capH;
+  const exit = E.expoIn(prog(lb, 3.4, 3.9));
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, base - cap - 20, 1000, cap + 40); ctx.clip();
+  font(ctx, size);
+  ctx.fillStyle = PAPER;
+  WORDS_F.forEach((w, k) => {
+    const pin = k === 0 ? E.expoOut(prog(lb, 0.1, 0.5)) : E.expoOut(prog(lb, k, k + 0.4));
+    const pout = k < 3 ? E.expoOut(prog(lb, k + 1, k + 1.4)) : exit;
+    if (pin <= 0 || pout >= 1) return;
+    ctx.fillText(w, 140, base + (1 - pin) * (cap + 40) - pout * (cap + 40));
+  });
+  ctx.restore();
+  if (lb > 0.3 && lb < 3.4) {
+    font(ctx, 40, true);
+    ctx.fillStyle = GRAY2;
+    ctx.fillText(typed(`morph · ${NPTS} points · ${['circle', 'triangle', 'star', 'star'][clamp(Math.floor(lb), 0, 3)]}`, prog(lb, 0.3, 0.9)), 146, base + 80);
+  }
+}
+
+// ---- scene G: montage (beats 24-28) --------------------------------------------------------
+const CARDS = [
+  { word: 'KINETIC', bg: ACCENT, fg: INK, fx: 'punch', width: 1600, base: 700 },
+  { word: 'TYPE', bg: PAPER, fg: INK, fx: 'drift', width: 2300, base: 900 },
+  { word: 'RHYTHM', bg: INK, fg: PAPER, fx: 'bar', width: 1560, base: 640 },
+  { word: 'TIMING', bg: ACCENT, fg: INK, fx: 'drop', width: 1600, base: 740 },
+  { word: 'SYSTEMS', bg: PAPER, fg: INK, fx: 'mono', width: 1600, base: 640, ui: true },
+  { word: 'STORY', bg: INK, fg: ACCENT, fx: 'skew', width: 1600, base: 760 },
+  { word: 'CRAFT', bg: PAPER, fg: INK, fx: 'squeeze', width: 1600, base: 800 },
+  { word: 'FEEL', bg: INK, fg: PAPER, fx: 'track', width: 1200, base: 700 },
+];
+function sceneG(ctx, b) {
+  const lb = b - 24;
+  const k = clamp(Math.floor(lb * 2), 0, 7);
+  const c = CARDS[k];
+  const t = (lb - k * 0.5) * P; // seconds into this card
+  ctx.fillStyle = c.bg;
+  ctx.fillRect(-60, -60, W + 120, H + 120);
+  const size = sizeToWidth(ctx, c.word, c.width, c.ui);
+  const l = layout(ctx, c.word, size, c.ui);
+  const x = 160;
+  font(ctx, 40, true);
+  ctx.fillStyle = c.fg;
+  ctx.fillText(`0${k + 1} / 08`, x + 6, c.base - l.capH * 1.22 - 40);
+  font(ctx, size, c.ui);
+  ctx.save();
+  ctx.translate(x, c.base);
+  const pe = E.expoOut(clamp(t / 0.22));
+  if (c.fx === 'punch') { const s = lerp(1.22, 1, pe); ctx.scale(s, s); }
+  if (c.fx === 'drift') ctx.translate(-t * 900, 0);
+  if (c.fx === 'skew') ctx.transform(1, 0, -0.5 * (1 - pe), 1, 0, 0);
+  if (c.fx === 'squeeze') ctx.scale(1, lerp(0.35, 1, E.backOut(clamp(t / 0.2), 2.5)));
+  ctx.fillStyle = c.fg;
+  l.letters.forEach((le, i) => {
+    let dx = le.x, dy = 0;
+    if (c.fx === 'drop') dy = -(1 - E.expoOut(clamp((t - i * 0.018) / 0.16))) * 160;
+    if (c.fx === 'track') dx = le.x * lerp(1.6, 1, pe);
+    ctx.fillText(le.ch, dx, dy);
+  });
+  ctx.restore();
+  if (c.fx === 'bar') { ctx.fillStyle = ACCENT; ctx.fillRect(x, c.base + 40, l.width * pe, 24); }
+  // The lockup square drops in over the last card and lands on the cut.
+  if (k === 7) drawSquare(ctx, hop([{ b: 28, x: LOCK.x + LOCK.side / 2, y: LOCK.bottom, h: 0 }], b), LOCK.side);
+}
+
+// ---- scene H: lockup (beats 28-30) --------------------------------------------------------
+const LOCK = { x: 160, side: 150, bottom: 560 };
+function sceneH(ctx, b) {
+  const lb = b - 28;
+  const t = lb * P;
+  const { side, x: sx, bottom } = LOCK;
+  const s = { x: sx + side / 2, y: bottom, vy: 0, since: t, rot: 0 };
+
+  // Shockwave: a hairline shoots out from the impact, then retracts.
+  const sw = E.expoOut(clamp(t / 0.25)), back = E.expoIn(clamp((t - 0.18) / 0.2));
+  if (back < 1) {
+    ctx.fillStyle = ACCENT;
+    const reach = 1800 * sw, start = 1800 * back;
+    ctx.fillRect(sx + side + 20 + start, bottom + 28, Math.max(0, reach - start), 4);
+  }
+
+  const size = 220;
+  const l = layout(ctx, 'CLAUDE', size);
+  const reveal = E.expoOut(prog(lb, 0.12, 0.9));
+  ctx.save();
+  ctx.beginPath(); ctx.rect(sx + side + 10, 0, W, H); ctx.clip();
+  font(ctx, size);
+  ctx.fillStyle = PAPER;
+  ctx.fillText('CLAUDE', sx + side + 40 - (1 - reveal) * (l.width + 80), bottom);
+  ctx.restore();
+  drawSquare(ctx, s, side);
+
+  font(ctx, 40, true);
+  const lines = [
+    { text: 'motion designer — reel 2026', at: 0.5, color: PAPER },
+    { text: 'every frame and every sound, written in code', at: 1.0, color: GRAY2 },
+  ];
+  lines.forEach((ln, i) => {
+    const p = prog(lb, ln.at, ln.at + 0.55);
+    if (p <= 0) return;
+    const shown = typed(ln.text, p);
+    const y = bottom + 100 + i * 60;
+    ctx.fillStyle = ln.color;
+    ctx.fillText(shown, sx, y);
+    const last = i === lines.length - 1 || prog(lb, lines[i + 1].at, lines[i + 1].at + 0.01) <= 0;
+    if (last && (p < 1 || Math.floor(t * 4) % 2 === 0)) {
+      ctx.fillStyle = ACCENT;
+      ctx.fillRect(sx + ctx.measureText(shown).width + 8, y - 32, 22, 40);
+    }
+  });
+}
+
+// ---- camera shake on impacts ---------------------------------------------------------------
+const IMPACTS = [
+  { b: 0, a: 20 }, { b: 1, a: 6 }, { b: 1.5, a: 6 }, { b: 2, a: 6 }, { b: 2.5, a: 6 },
+  { b: 4, a: 9 }, { b: 5, a: 9 }, { b: 6, a: 9 }, { b: 7, a: 9 }, { b: 24, a: 16 }, { b: 28, a: 30 },
+];
+function shake(t) {
+  let x = 0, y = 0;
+  IMPACTS.forEach((im, i) => {
+    const dt = t - beatTime(im.b);
+    if (dt < 0) return;
+    const env = im.a * Math.exp(-dt * 10);
+    x += env * noise1(dt * 40 + i * 37);
+    y += env * noise1(dt * 40 + i * 37 + 200);
+  });
+  return [x, y];
+}
+
+// ---- frame ---------------------------------------------------------------------------------
+const SCENES = [[0, sceneA], [4, sceneB], [8, sceneC], [12, sceneD], [16, sceneE], [20, sceneF], [24, sceneG], [28, sceneH]];
+function draw(ctx, t) {
+  const b = (t - O) / P;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = INK;
+  ctx.fillRect(0, 0, W, H);
+  const [sx, sy] = shake(t);
+  ctx.translate(sx, sy);
+  let scene = SCENES[0][1];
+  for (const [start, fn] of SCENES) if (b >= start) scene = fn;
+  scene(ctx, b);
+}
+
+// Film grain: fixed tiles from seeded noise, chosen per frame.
+const GRAIN = (() => {
+  const r = mulberry32(99);
+  return [0, 1, 2].map(() => {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d'), img = g.createImageData(256, 256);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = r() * 255;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    return c;
+  });
+})();
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const acc = document.createElement('canvas'); acc.width = W; acc.height = H;
+const actx = acc.getContext('2d');
+const SHUTTER = 1 / 60; // 180-degree shutter at 30 fps
+const SAMPLES = window.RENDER ? 6 : 1;
+// Hard cuts (scene starts and montage cards); the shutter never integrates across one.
+const CUTS = [4, 8, 12, 16, 20, 24, 24.5, 25, 25.5, 26, 26.5, 27, 27.5, 28].map(beatTime);
+const lastCut = (t) => CUTS.reduce((m, c) => (c <= t ? c : m), -Infinity);
+
+window.seek = function (t) {
+  if (SAMPLES === 1) {
+    draw(ctx, t);
+  } else {
+    // Motion blur: running average of sub-frame samples across the shutter interval.
+    for (let i = 0; i < SAMPLES; i++) {
+      draw(actx, Math.max(lastCut(t), t - SHUTTER * (1 - i / (SAMPLES - 1))));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1 / (i + 1);
+      ctx.drawImage(acc, 0, 0);
+    }
+  }
+  const frame = Math.round(t * 30);
+  const r = mulberry32(frame + 1);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 0.07;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = ctx.createPattern(GRAIN[frame % 3], 'repeat');
+  ctx.translate(-r() * 256, -r() * 256);
+  ctx.fillRect(0, 0, W + 256, H + 256);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+};
+
+window.READY = Promise.all([document.fonts.load('900 100px Display'), document.fonts.load('500 30px UI')]);
+
+if (!window.RENDER) {
+  // Preview: click to play with sound; otherwise loops silently.
+  const audio = new Audio('audio.wav');
+  document.body.addEventListener('click', () => { audio.currentTime = 0; audio.play(); });
+  window.READY.then(() => {
+    const loop = () => {
+      seek(audio.paused ? (performance.now() / 1000) % window.DURATION : audio.currentTime);
+      requestAnimationFrame(loop);
+    };
+    loop();
+  });
+}
+</script>
+</body>
+</html>

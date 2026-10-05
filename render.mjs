@@ -1,5 +1,5 @@
 // Deterministic film renderer: seeks the page to each frame time, screenshots it, pipes PNGs to ffmpeg.
-// Usage: node render.mjs films/<name> [--sheet] [--fps 30] [--width 1920] [--height 1080] [--out path]
+// Usage: node render.mjs films/<name> [--sheet | --at t1,t2,...] [--fps 30] [--width 1920] [--height 1080] [--out path]
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
@@ -12,7 +12,7 @@ const opt = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 ? args[i + 1] : fallback;
 };
-const valued = new Set(['--fps', '--width', '--height', '--out']);
+const valued = new Set(['--fps', '--width', '--height', '--out', '--at']);
 const filmDir = args.find((a, i) => !a.startsWith('--') && !valued.has(args[i - 1]));
 if (!filmDir) {
   console.error('usage: node render.mjs films/<name> [--sheet] [--fps 30] [--width 1920] [--height 1080] [--out path]');
@@ -22,7 +22,8 @@ const name = basename(resolve(filmDir));
 const fps = Number(opt('fps', 30));
 const width = Number(opt('width', 1920));
 const height = Number(opt('height', 1080));
-const sheet = flag('sheet');
+const at = opt('at', null)?.split(',').map(Number);
+const sheet = flag('sheet') || Boolean(at);
 const out = opt('out', `out/${name}${sheet ? '-sheet.png' : '.mp4'}`);
 const audio = join(filmDir, 'audio.wav');
 const beatsFile = join(filmDir, 'beats.json');
@@ -50,7 +51,7 @@ const browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePa
 const page = await browser.newPage({ viewport: { width, height } });
 await page.addInitScript(() => { window.RENDER = true; });
 await page.goto(pathToFileURL(resolve(filmDir, 'index.html')).href);
-await page.evaluate(() => document.fonts.ready);
+await page.evaluate(async () => { await window.READY; await document.fonts.ready; });
 const duration = await page.evaluate(() => {
   if (typeof window.seek !== 'function') throw new Error('film must define window.seek(t)');
   if (!(window.DURATION > 0)) throw new Error('film must set window.DURATION in seconds');
@@ -63,9 +64,10 @@ async function frameAt(t) {
 }
 
 if (sheet) {
-  const times = existsSync(beatsFile)
-    ? JSON.parse(readFileSync(beatsFile, 'utf8')).beats.filter((t) => t < duration)
-    : Array.from({ length: Math.ceil(duration) }, (_, i) => i);
+  const grid = existsSync(beatsFile) ? JSON.parse(readFileSync(beatsFile, 'utf8')) : null;
+  const times = at ?? (grid?.period
+    ? Array.from({ length: Math.ceil((duration - grid.offset) / grid.period) }, (_, i) => grid.offset + i * grid.period)
+    : grid ? grid.beats.filter((t) => t < duration) : Array.from({ length: Math.ceil(duration) }, (_, i) => i));
   const cols = Math.min(6, times.length);
   const rows = Math.ceil(times.length / cols);
   const enc = ffmpeg(['-f', 'image2pipe', '-c:v', 'png', '-i', '-',
