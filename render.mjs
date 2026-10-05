@@ -30,7 +30,7 @@ const beatsFile = join(filmDir, 'beats.json');
 
 // Two-pass loudnorm: measure first, then apply linearly so the result lands on -14 LUFS.
 async function loudnormFilter(file) {
-  const target = 'I=-14:TP=-2:LRA=11'; // 2 dB headroom: AAC encoding adds inter-sample overs
+  const target = 'I=-14:TP=-3:LRA=11'; // headroom: AAC encoding adds up to ~2 dB of inter-sample overs on sharp transients
   const proc = spawn('ffmpeg', ['-hide_banner', '-i', file, '-af', `loudnorm=${target}:print_format=json`, '-f', 'null', '-']);
   let log = '';
   proc.stderr.on('data', (d) => { log += d; });
@@ -82,7 +82,7 @@ if (sheet) {
   const hasAudio = existsSync(audio);
   const enc = ffmpeg([
     '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'png', '-i', '-',
-    ...(hasAudio ? ['-i', audio, '-af', await loudnormFilter(audio), '-c:a', 'aac', '-b:a', '192k', '-shortest'] : []),
+    ...(hasAudio ? ['-i', audio, '-af', await loudnormFilter(audio), '-c:a', 'aac', '-b:a', '256k', '-shortest'] : []),
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '16', '-preset', 'slow', '-movflags', '+faststart', out,
   ]);
   for (let f = 0; f < total; f++) {
