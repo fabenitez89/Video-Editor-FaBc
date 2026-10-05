@@ -1,0 +1,26 @@
+{
+  "name": "motion-studio",
+  "version": "1.0.0",
+  "description": "Motion graphics studio: HTML/Remotion/HyperFrames animations rendered with headless Chromium + ffmpeg",
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fabenitez89/Video-Editor-FaBc.git"
+  },
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/fabenitez89/Video-Editor-FaBc/issues"
+  },
+  "homepage": "https://github.com/fabenitez89/Video-Editor-FaBc#readme",
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  }
+}
