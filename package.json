@@ -4,7 +4,9 @@
   "description": "Motion graphics studio: HTML/Remotion/HyperFrames animations rendered with headless Chromium + ffmpeg",
   "scripts": {
     "setup": "bash scripts/setup.sh",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "render": "node render.mjs",
+    "beats": "python3 scripts/beats.py"
   },
   "repository": {
     "type": "git",
