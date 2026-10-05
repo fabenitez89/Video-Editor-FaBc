@@ -7,3 +7,4 @@ renders/
 __pycache__/
 .venv/
 .DS_Store
+films/*/stem-*.wav

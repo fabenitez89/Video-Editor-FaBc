@@ -1,0 +1,893 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Étude</title>
+<style>
+  @font-face { font-family: 'Serif'; src: url(fonts/instrument-serif.woff2) format('woff2'); font-style: normal; }
+  @font-face { font-family: 'Serif'; src: url(fonts/instrument-serif-italic.woff2) format('woff2'); font-style: italic; }
+  @font-face { font-family: 'UI'; src: url(fonts/jetbrains-mono-500.woff2) format('woff2'); font-weight: 500; }
+  html, body { margin: 0; background: #0b0b0d; }
+  canvas { display: block; width: 100vw; height: auto; }
+</style>
+<script src="notes.js"></script>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Étude for piano and machine. 60 s, every visual driven by the score's own note list (notes.js).
+// Pure function of time: seek(t) paints frame t from scratch.
+const W = 1920, H = 1080;
+window.DURATION = 60;
+
+const INK = '#0b0b0d', PAPER = '#eee8dc', ACCENT = '#ff4b2b', GRAY = '#4a4741', GRAY2 = '#a9a397';
+const SCORE = window.SCORE;
+const BAR = SCORE.bar, BEAT = SCORE.beat;
+const NOTES = SCORE.notes.map((n, i) => ({ ...n, i })).sort((a, b) => a.t - b.t);
+const PERC = SCORE.perc;
+const PEDAL_OFF = SCORE.sfx.find((s) => s.kind === 'pedal').t;
+const BOOMS = SCORE.sfx.filter((s) => s.kind === 'boom').map((s) => s.t);
+
+// ---- math -----------------------------------------------------------------------------------
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, x) => a + (b - a) * x;
+const prog = (x, a, b) => clamp((x - a) / (b - a));
+const E = {
+  expoOut: (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x)),
+  expoIn: (x) => (x <= 0 ? 0 : Math.pow(2, 10 * x - 10)),
+  expoInOut: (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x < 0.5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2),
+  cubicInOut: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+  quadIn: (x) => x * x,
+  backOut: (x, s = 1.7) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2),
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const NOISE = (() => { const r = mulberry32(11); return Array.from({ length: 512 }, () => r() * 2 - 1); })();
+function noise1(x) {
+  const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f);
+  return lerp(NOISE[((i % 512) + 512) % 512], NOISE[(((i + 1) % 512) + 512) % 512], s);
+}
+function hex(c) { return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); }
+function mix(a, b, x) {
+  const pa = hex(a), pb = hex(b);
+  return `rgb(${pa.map((v, i) => Math.round(lerp(v, pb[i], clamp(x)))).join(',')})`;
+}
+
+// ---- type -------------------------------------------------------------------------------------
+function font(ctx, size, kind = 'serif') {
+  ctx.font = kind === 'ui' ? `500 ${size}px UI` : kind === 'italic' ? `italic 400 ${size}px Serif` : `400 ${size}px Serif`;
+}
+const layoutCache = new Map();
+function layout(ctx, word, size, kind = 'serif', track = 0) {
+  const key = `${word}|${size}|${kind}|${track}`;
+  if (layoutCache.has(key)) return layoutCache.get(key);
+  font(ctx, size, kind);
+  let x = 0;
+  const letters = [];
+  for (const ch of word) { const w = ctx.measureText(ch).width; letters.push({ ch, x, w }); x += w + track * size; }
+  const m = ctx.measureText('Hd');
+  const out = { letters, width: x - track * size, asc: m.actualBoundingBoxAscent };
+  layoutCache.set(key, out);
+  return out;
+}
+const typed = (text, p) => text.slice(0, Math.floor(text.length * clamp(p) + 1e-6));
+function fitSize(ctx, word, width, kind) { return (100 * width) / layout(ctx, word, 100, kind).width; }
+
+// Letters rise out of a mask line, staggered; exit drops them back.
+function maskedWord(ctx, word, x, base, size, kind, tIn, tOut, t, color, stagger = 0.045) {
+  const l = layout(ctx, word, size, kind);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x - size, base - l.asc * 1.35, l.width + size * 2, l.asc * 1.35 + size * 0.32); ctx.clip();
+  font(ctx, size, kind);
+  ctx.fillStyle = color;
+  l.letters.forEach((le, i) => {
+    const pin = E.expoOut(prog(t, tIn + i * stagger, tIn + i * stagger + 0.55));
+    const pout = E.expoIn(prog(t, tOut + i * stagger * 0.5, tOut + i * stagger * 0.5 + 0.35));
+    if (pin <= 0 || pout >= 1) return;
+    ctx.fillText(le.ch, x + le.x, base + (1 - pin) * size * 1.1 - pout * size * 1.2);
+  });
+  ctx.restore();
+  return l;
+}
+
+// ---- pitch -------------------------------------------------------------------------------------
+const PC_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'G#', 'A', 'Bb', 'B'];
+const pitchName = (m) => `${PC_NAMES[m % 12]}${Math.floor(m / 12) - 1}`;
+const hz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+const CHORD_NAMES = { Dm: 'D minor', Bb: 'Bb major', F: 'F major', C: 'C major', Gm: 'G minor', A: 'A major' };
+
+// ---- the strings: visible vibration of each note --------------------------------------------------
+const BY_PITCH = new Map();
+NOTES.forEach((n) => { if (!BY_PITCH.has(n.m)) BY_PITCH.set(n.m, []); BY_PITCH.get(n.m).push(n); });
+const tauVis = (m) => 0.35 + 1.8 * Math.pow(1 - (m - 21) / 87, 1.5);
+const fVis = (m) => 3.2 + ((m - 21) / 87) * 9;
+const STRIKE = 1 / 8.3; // the synth's hammer position, so the visible mode shapes match the sound
+const MODES = [1, 2, 3, 4, 5, 6].map((k) => Math.abs(Math.sin(k * Math.PI * STRIKE)) / Math.pow(k, 1.1));
+
+function energy(n, t) {
+  const dt = t - n.t;
+  if (dt < 0) return 0;
+  let e = n.v * Math.exp(-dt / tauVis(n.m));
+  if (t > n.end) e *= Math.exp(-(t - n.end) / 0.07);
+  return e;
+}
+function pitchEnergy(m, t) {
+  let e = 0;
+  for (const n of BY_PITCH.get(m) || []) { if (n.t > t) break; if (t - n.t < 8) e += energy(n, t); }
+  return e;
+}
+// Mode coefficients of a string at time t; displacement(u) = sum_k c_k sin(k pi u).
+function stringCoeffs(m, t, slow = 1) {
+  const c = [0, 0, 0, 0, 0, 0];
+  const f = fVis(m);
+  for (const n of BY_PITCH.get(m) || []) {
+    if (n.t > t) break;
+    if (t - n.t > 8) continue;
+    const e = energy(n, t);
+    if (e < 0.002) continue;
+    const dt = (t - n.t) * slow;
+    for (let k = 0; k < 6; k++) {
+      c[k] += e * MODES[k] * Math.cos(TAU * (k + 1) * f * dt * (1 + 0.004 * k * k)) * Math.exp(-dt * 0.9 * (k + 1));
+    }
+  }
+  return c;
+}
+const dispAt = (c, u) => c.reduce((s, ck, k) => s + ck * Math.sin((k + 1) * Math.PI * u), 0);
+
+// Hammer: rises to the string, strikes at the onset, rebounds.
+function hammerOffset(m, t) {
+  for (const n of BY_PITCH.get(m) || []) {
+    const d = n.t - t;
+    if (d > 0.12) break;
+    if (d < -0.28) continue;
+    return { off: d > 0 ? 18 + (d / 0.12) * 70 : 18 + E.expoOut(-d / 0.28) * 90, v: n.v, gone: d < 0 ? E.expoIn(-d / 0.28) : 0 };
+  }
+  return null;
+}
+
+// Draw a horizontal string between (x0,y) and (x1,y) in a projected space.
+function drawString(ctx, pts, e, width = 2) {
+  // Hard strikes flash the accent for an instant, then settle to paper.
+  ctx.strokeStyle = e > 0.42 ? mix(PAPER, ACCENT, clamp((e - 0.42) * 4)) : mix('#6a665e', PAPER, clamp(e * 4));
+  ctx.lineWidth = width + clamp(e * 2) * 2;
+  ctx.beginPath();
+  pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+  ctx.stroke();
+}
+
+// ---- notation -------------------------------------------------------------------------------------
+const LETTER = [[0, ''], [0, '#'], [1, ''], [2, 'b'], [2, ''], [3, ''], [3, '#'], [4, ''], [4, '#'], [5, ''], [6, 'b'], [6, '']];
+const dia = (m) => (Math.floor(m / 12) - 1) * 7 + LETTER[m % 12][0];
+const accidental = (m) => LETTER[m % 12][1];
+const TREBLE = new Set(['melody', 'motif', 'high', 'bell', 'tremolo', 'arp']);
+const onTreble = (n) => (n.voice === 'coda' ? n.m >= 60 : TREBLE.has(n.voice));
+function staffLayout(box, sp) {
+  const trebleTop = box.y + box.h * 0.3;
+  const trebleBottom = trebleTop + 4 * sp;
+  const bassTop = trebleBottom + sp * 5;
+  return { sp, trebleTop, trebleBottom, bassTop, bassBottom: bassTop + 4 * sp };
+}
+const beatsOf = (n) => n.d / BEAT;
+
+function drawFlat(ctx, x, y, sp) {
+  ctx.lineWidth = sp * 0.11;
+  ctx.beginPath();
+  ctx.moveTo(x, y - sp * 1.5); ctx.lineTo(x, y + sp * 0.45);
+  ctx.bezierCurveTo(x + sp * 0.9, y + sp * 0.05, x + sp * 0.75, y - sp * 0.55, x, y - sp * 0.1);
+  ctx.stroke();
+}
+function drawSharp(ctx, x, y, sp) {
+  ctx.lineWidth = sp * 0.1;
+  ctx.beginPath();
+  ctx.moveTo(x - sp * 0.15, y - sp * 1.1); ctx.lineTo(x - sp * 0.15, y + sp * 1.2);
+  ctx.moveTo(x + sp * 0.25, y - sp * 1.2); ctx.lineTo(x + sp * 0.25, y + sp * 1.1);
+  ctx.stroke();
+  ctx.lineWidth = sp * 0.22;
+  ctx.beginPath();
+  ctx.moveTo(x - sp * 0.45, y - sp * 0.25); ctx.lineTo(x + sp * 0.55, y - sp * 0.45);
+  ctx.moveTo(x - sp * 0.45, y + sp * 0.45); ctx.lineTo(x + sp * 0.55, y + sp * 0.25);
+  ctx.stroke();
+}
+
+// A scrolling grand staff. opts: { notes, sp, pps, playX, lyrics: Map(noteIndex -> {text, hyphen}), ts }
+function drawStaff(ctx, box, t, opts) {
+  const L = staffLayout(box, opts.sp);
+  const { sp } = L;
+  const playX = box.x + box.w * opts.play;
+  const ts = opts.ts ?? t;
+  const X = (time) => playX + (time - ts) * opts.pps;
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(box.x, box.y, box.w, box.h);
+  ctx.strokeStyle = INK; ctx.fillStyle = INK; ctx.lineWidth = Math.max(1.2, sp * 0.06);
+  for (const top of [L.trebleTop, L.bassTop]) {
+    for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.moveTo(box.x, top + i * sp); ctx.lineTo(box.x + box.w, top + i * sp); ctx.stroke(); }
+  }
+  // Bar lines and numbers.
+  font(ctx, Math.round(sp * 1.1), 'ui');
+  for (let b = Math.floor((ts - (playX - box.x) / opts.pps) / BAR); b <= Math.ceil((ts + (box.x + box.w - playX) / opts.pps) / BAR); b++) {
+    const x = X(b * BAR) - sp * 1.2;
+    if (x < box.x || x > box.x + box.w) continue;
+    ctx.lineWidth = sp * 0.08;
+    ctx.beginPath(); ctx.moveTo(x, L.trebleTop); ctx.lineTo(x, L.bassBottom); ctx.stroke();
+    ctx.fillStyle = GRAY;
+    ctx.fillText(String(b + 1), x + sp * 0.3, L.trebleTop - sp * 3.6);
+  }
+
+  const yOf = (n) => (onTreble(n) ? L.trebleBottom - ((dia(n.m) - 30) * sp) / 2 : L.bassBottom - ((dia(n.m) - 18) * sp) / 2);
+  const mid = (n) => (onTreble(n) ? 34 : 22);
+  const visible = opts.notes.filter((n) => { const x = X(n.t); return x > box.x - sp * 4 && x < box.x + box.w + sp * 4; });
+  const rx = sp * 0.62, ry = sp * 0.45;
+  const groups = new Map();
+  for (const n of visible) {
+    const x = X(n.t), y = yOf(n);
+    const sounding = t >= n.t && t < Math.max(n.t + 0.12, n.t + n.d);
+    const col = sounding ? ACCENT : INK;
+    ctx.strokeStyle = INK; ctx.lineWidth = sp * 0.07;
+    // Ledger lines.
+    const d = dia(n.m);
+    const [lo, hi] = onTreble(n) ? [30, 38] : [18, 26];
+    for (let k = lo - 2; k >= d; k -= 2) { const ly = y + ((d - k) * sp) / 2; ctx.beginPath(); ctx.moveTo(x - rx * 1.6, ly); ctx.lineTo(x + rx * 1.6, ly); ctx.stroke(); }
+    for (let k = hi + 2; k <= d; k += 2) { const ly = y + ((d - k) * sp) / 2; ctx.beginPath(); ctx.moveTo(x - rx * 1.6, ly); ctx.lineTo(x + rx * 1.6, ly); ctx.stroke(); }
+    ctx.strokeStyle = col; ctx.fillStyle = col;
+    const a = accidental(n.m);
+    if (a === 'b') drawFlat(ctx, x - rx - sp * 1.0, y, sp);
+    if (a === '#') drawSharp(ctx, x - rx - sp * 0.9, y, sp);
+    const beats = beatsOf(n);
+    ctx.save(); ctx.translate(x, y); ctx.rotate(-0.35);
+    ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, 0, TAU);
+    if (beats >= 1.95) { ctx.lineWidth = sp * 0.17; ctx.stroke(); } else ctx.fill();
+    ctx.restore();
+    if ([1.5, 0.75, 3].some((v) => Math.abs(beats - v) < 0.02)) {
+      ctx.beginPath(); ctx.arc(x + rx + sp * 0.45, y - ((d % 2 === 0) === ((onTreble(n) ? 30 : 18) % 2 === 0) ? sp / 2 : 0), sp * 0.15, 0, TAU); ctx.fill();
+    }
+    // Hit ring on the onset.
+    const hr = t - n.t;
+    if (hr >= 0 && hr < 0.3) {
+      ctx.strokeStyle = ACCENT; ctx.lineWidth = sp * 0.12 * (1 - hr / 0.3);
+      ctx.beginPath(); ctx.arc(x, y, rx + E.expoOut(hr / 0.3) * sp * 1.6, 0, TAU); ctx.stroke();
+    }
+    const beamed = (n.voice === 'lh' && Math.abs(beats - 0.5) < 0.02) || (n.voice === 'arp' && Math.abs(beats - 0.25) < 0.02);
+    if (beamed) {
+      const gid = `${n.voice}:${Math.floor(n.t / (n.voice === 'lh' ? 2 * BEAT : BEAT) + 0.02)}`;
+      if (!groups.has(gid)) groups.set(gid, []);
+      groups.get(gid).push({ n, x, y, col });
+    } else if (beats < 3.95) {
+      const up = d < mid(n);
+      ctx.strokeStyle = col; ctx.lineWidth = sp * 0.09;
+      const sx = up ? x + rx - sp * 0.05 : x - rx + sp * 0.05;
+      const ey = up ? y - sp * 3.5 : y + sp * 3.5;
+      ctx.beginPath(); ctx.moveTo(sx, y); ctx.lineTo(sx, ey); ctx.stroke();
+      if (beats < 0.9) {
+        ctx.lineWidth = sp * 0.16;
+        ctx.beginPath(); ctx.moveTo(sx, ey);
+        ctx.bezierCurveTo(sx + sp * 0.9, ey + (up ? 1 : -1) * sp * 1.0, sx + sp * 1.0, ey + (up ? 1 : -1) * sp * 1.8, sx + sp * 0.5, ey + (up ? 1 : -1) * sp * 2.4);
+        ctx.stroke();
+      }
+    }
+    const lyr = opts.lyrics?.get(n.i);
+    if (lyr) {
+      const sung = t >= n.t;
+      font(ctx, sp * 3.2, 'italic');
+      ctx.fillStyle = sung ? INK : GRAY2;
+      const lift = sung ? 0 : 0;
+      ctx.fillText(lyr.text, x - rx, L.trebleTop - sp * 5.2 + lift);
+      if (lyr.hyphen) {
+        const w = ctx.measureText(lyr.text).width;
+        ctx.fillRect(x - rx + w + sp * 0.6, L.trebleTop - sp * 6.1, sp * 0.9, sp * 0.12);
+      }
+    }
+  }
+  for (const g of groups.values()) {
+    const up = g.reduce((s, q) => s + dia(q.n.m), 0) / g.length < mid(g[0].n);
+    const by = up ? Math.min(...g.map((q) => q.y)) - sp * 3.3 : Math.max(...g.map((q) => q.y)) + sp * 3.3;
+    ctx.lineWidth = sp * 0.09;
+    for (const q of g) {
+      ctx.strokeStyle = q.col;
+      const sx = up ? q.x + rx - sp * 0.05 : q.x - rx + sp * 0.05;
+      ctx.beginPath(); ctx.moveTo(sx, q.y); ctx.lineTo(sx, by); ctx.stroke();
+    }
+    if (g.length > 1) {
+      ctx.fillStyle = INK;
+      const x0 = up ? g[0].x + rx : g[0].x - rx, x1 = up ? g[g.length - 1].x + rx : g[g.length - 1].x - rx;
+      const beams = g[0].n.voice === 'arp' ? 2 : 1;
+      for (let k = 0; k < beams; k++) {
+        const yy = by + (up ? 1 : -1) * k * sp * 0.75 - (up ? 0 : sp * 0.45);
+        ctx.fillRect(x0 - sp * 0.05, yy, x1 - x0 + sp * 0.1, sp * 0.45);
+      }
+    }
+  }
+  // Playhead.
+  ctx.fillStyle = ACCENT;
+  ctx.fillRect(playX - sp * 0.08, L.trebleTop - sp * 2.5, sp * 0.16, L.bassBottom - L.trebleTop + sp * 5);
+}
+
+// ---- radial piano roll ------------------------------------------------------------------------------
+const VOICE_COLOR = { arp: PAPER, lh: GRAY2, bass: GRAY2, bell: ACCENT, melody: ACCENT, motif: PAPER, tremolo: PAPER, high: PAPER, coda: PAPER };
+function drawRadial(ctx, cx, cy, S, t, opts = {}) {
+  const r0 = S * 0.13, r1 = S * 0.47;
+  const rOf = (m) => r0 + ((m - 28) / (96 - 28)) * (r1 - r0);
+  const T0 = Math.floor(t / BAR) * BAR;
+  const ang = (time) => -Math.PI / 2 + ((time - T0) / BAR) * TAU;
+  const sweep = ang(t);
+  ctx.lineCap = 'butt';
+  // Octave guides.
+  ctx.strokeStyle = GRAY; ctx.lineWidth = 1;
+  for (let m = 36; m <= 96; m += 12) { ctx.beginPath(); ctx.arc(cx, cy, rOf(m), 0, TAU); ctx.stroke(); }
+  if (opts.labels) {
+    font(ctx, Math.round(S * 0.026), 'ui'); ctx.fillStyle = GRAY2;
+    for (let m = 36; m <= 84; m += 12) ctx.fillText(`C${m / 12 - 1}`, cx + 8, cy - rOf(m) - 6);
+  }
+  for (const n of opts.notes) {
+    if (n.t > t) break;
+    if (n.t <= t - BAR * 0.985) continue;
+    const a0 = ang(n.t) - (n.t < T0 ? -TAU : 0) - (n.t < T0 ? TAU : 0);
+    const start = n.t < T0 ? ang(n.t + BAR) : ang(n.t);
+    const endT = Math.min(n.end, t, n.t + BAR * 0.95);
+    const end = start + ((endT - n.t) / BAR) * TAU;
+    ctx.strokeStyle = VOICE_COLOR[n.voice] || PAPER;
+    ctx.lineWidth = (S / 1080) * (3 + 9 * n.v);
+    ctx.beginPath(); ctx.arc(cx, cy, rOf(n.m), start, Math.max(start + 0.01, end)); ctx.stroke();
+    void a0;
+  }
+  // Percussion: kick swells the hub, knock rings the rim, ticks light the dial.
+  let kick = 0, knock = 0;
+  for (const p of PERC) {
+    if (p.t > t) break;
+    const dt = t - p.t;
+    if (dt > 0.6) continue;
+    if (p.kind === 'kick') kick += p.v * Math.exp(-dt * 9);
+    if (p.kind === 'knock') knock += p.v * Math.exp(-dt * 12);
+    if (p.kind === 'tick' && p.t >= T0 && dt < 0.25) {
+      const a = ang(p.t);
+      ctx.strokeStyle = PAPER; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * (r1 + S * 0.02), cy + Math.sin(a) * (r1 + S * 0.02));
+      ctx.lineTo(cx + Math.cos(a) * (r1 + S * 0.04), cy + Math.sin(a) * (r1 + S * 0.04)); ctx.stroke();
+    }
+  }
+  ctx.fillStyle = ACCENT;
+  ctx.beginPath(); ctx.arc(cx, cy, S * (0.03 + 0.05 * kick), 0, TAU); ctx.fill();
+  if (knock > 0.02) { ctx.strokeStyle = PAPER; ctx.lineWidth = 2 + knock * 6; ctx.beginPath(); ctx.arc(cx, cy, r1 + S * 0.065, 0, TAU); ctx.stroke(); }
+  ctx.strokeStyle = ACCENT; ctx.lineWidth = Math.max(2, S * 0.003);
+  ctx.beginPath(); ctx.moveTo(cx + Math.cos(sweep) * r0 * 0.6, cy + Math.sin(sweep) * r0 * 0.6); ctx.lineTo(cx + Math.cos(sweep) * (r1 + S * 0.05), cy + Math.sin(sweep) * (r1 + S * 0.05)); ctx.stroke();
+  if (opts.tag) {
+    const bar = Math.floor(t / BAR);
+    font(ctx, Math.round(S * 0.032), 'ui'); ctx.fillStyle = PAPER;
+    font(ctx, 42, 'ui');
+    ctx.fillText(`bar ${bar + 1}`, 140, cy - 10);
+    ctx.fillStyle = GRAY2;
+    ctx.fillText(CHORD_NAMES[SCORE.chords[bar]], 140, cy + 46);
+    ctx.fillText('1 bar = 1 turn', 140, cy + 102);
+  }
+}
+
+// ---- 3D ---------------------------------------------------------------------------------------------
+function cam(v, yaw, pitch, dist, F, cx = W / 2, cy = H / 2) {
+  let [x, y, z] = v;
+  const cyw = Math.cos(yaw), syw = Math.sin(yaw);
+  [x, z] = [x * cyw - z * syw, x * syw + z * cyw];
+  const cp = Math.cos(pitch), spc = Math.sin(pitch);
+  [y, z] = [y * cp - z * spc, y * spc + z * cp];
+  const s = F / (F + z + dist);
+  return [cx + x * s, cy + y * s, z + dist, s];
+}
+const isBlack = (m) => [1, 3, 6, 8, 10].includes(m % 12);
+
+// ---- scene 1: strings (0-10 s) ------------------------------------------------------------------------
+const INTRO_PITCHES = [...new Set(NOTES.filter((n) => n.t < 10).map((n) => n.m))].sort((a, b) => a - b);
+const yOfPitch = (m) => 860 - ((m - 30) / (84 - 30)) * 640;
+const STAFF_FULL = staffLayout({ x: 0, y: 0, w: W, h: H }, 26);
+function scene1(ctx, t) {
+  const tilt = E.expoInOut(prog(t, 5.0, 6.6)) * 0.3 * (1 - E.expoInOut(prog(t, 9.2, 9.9)));
+  const yaw = E.expoInOut(prog(t, 5.0, 6.6)) * (1.05 + 0.12 * prog(t, 6.6, 9.2)) * (1 - E.expoInOut(prog(t, 9.2, 9.9)));
+  const exitP = E.expoInOut(prog(t, 9.3, 10.0));
+  let latest = null;
+  INTRO_PITCHES.forEach((m, rank) => {
+    const first = BY_PITCH.get(m)[0].t;
+    const appear = E.expoOut(prog(t, first - 0.4, first - 0.05));
+    if (appear <= 0 && exitP <= 0) return;
+    const line = Math.min(4, Math.floor((rank * 5) / INTRO_PITCHES.length));
+    const y = lerp(yOfPitch(m), STAFF_FULL.trebleTop + (4 - line) * 26, exitP);
+    const x0 = lerp(140, 0, exitP), x1 = lerp(140 + 1640 * Math.max(appear, exitP), W, exitP);
+    const c = stringCoeffs(m, t);
+    const amp = 170 * (1 - exitP);
+    const pts = [];
+    for (let i = 0; i <= 96; i++) {
+      const u = i / 96;
+      const v = [lerp(x0, x1, u) - W / 2, y - H / 2 + dispAt(c, u) * amp, 0];
+      pts.push(cam(v, yaw, tilt, 0, 1700));
+    }
+    const e = pitchEnergy(m, t);
+    drawString(ctx, pts, e, 3);
+    const hm = hammerOffset(m, t);
+    if (hm && exitP === 0) {
+      const hx = lerp(x0, x1, STRIKE) - W / 2;
+      const top = cam([hx, y - H / 2 + hm.off, 0], yaw, tilt, 0, 1700);
+      const s = top[3];
+      ctx.fillStyle = ACCENT;
+      ctx.fillRect(top[0] - 14 * s, top[1], 28 * s, (44 - hm.gone * 44) * s + 3);
+    }
+    const last = (BY_PITCH.get(m) || []).filter((n) => n.t <= t && n.t < 10).pop();
+    if (last && (!latest || last.t > latest.n.t)) latest = { n: last, end: pts[pts.length - 1] };
+  });
+  // Label the most recent note at its string's end.
+  if (latest && exitP < 0.3) {
+    const n = latest.n;
+    font(ctx, 42, 'ui'); ctx.fillStyle = PAPER;
+    const label = typed(`${pitchName(n.m)} · ${hz(n.m).toFixed(1)} Hz`, prog(t, n.t, n.t + 0.25));
+    const w = ctx.measureText(label).width;
+    ctx.fillText(label, Math.min(latest.end[0] - w, 1780 - w), latest.end[1] - 22);
+  }
+  // The hook: name what the viewer is looking at.
+  if (t < 4.9) {
+    font(ctx, 42, 'ui'); ctx.fillStyle = GRAY2;
+    ctx.fillText(typed('hammer strikes at 1/8.3 of the string', prog(t, 0.15, 1.1)), 140 + 1640 * STRIKE - 9, yOfPitch(74) + 120);
+    ctx.fillText(typed('six modes, same as the sound you hear', prog(t, 1.4, 2.3)), 140 + 1640 * STRIKE - 9, yOfPitch(74) + 170);
+  }
+  // Title.
+  maskedWord(ctx, 'Étude', 130, 560, 300, 'serif', 7.5, 9.25, t, PAPER, 0.08);
+  font(ctx, 40, 'ui'); ctx.fillStyle = GRAY2;
+  if (t < 9.3) ctx.fillText(typed('no. 1 — for piano and machine', prog(t, 8.2, 8.9)), 142, 640);
+}
+
+// ---- scene 2: the score (10-20 s) -------------------------------------------------------------------------
+const THEME_NOTES = NOTES.filter((n) => n.t < 22.6 && n.voice !== 'bass' || (n.voice === 'bass' && n.t < 10));
+const LYRICS = new Map();
+(() => {
+  const syl = [['lis', 1], ['ten', 0], ['with', 0], ['your', 0], ['eyes,', 0], ['and', 0], ['see', 0], ['the', 0], ['mu', 1], ['sic', 0], ['move', 0], ['in', 0], ['real', 0], ['time.', 0]];
+  NOTES.filter((n) => n.voice === 'melody' && n.t >= 9.9 && n.t < 20).forEach((n, i) => LYRICS.set(n.i, { text: syl[i][0], hyphen: syl[i][1] }));
+})();
+function scene2(ctx, t) {
+  const zoom = 1 + 0.3 * E.expoInOut(prog(t, 15, 15.7)) * (1 - E.expoInOut(prog(t, 17.5, 18.2)));
+  const whip = E.expoIn(prog(t, 19.3, 20.0)) * 2.4;
+  const playX = W * 0.32;
+  ctx.save();
+  ctx.translate(playX, 470); ctx.scale(zoom, zoom); ctx.translate(-playX, -470);
+  drawStaff(ctx, { x: -400, y: 0, w: W + 800, h: H }, t, { notes: THEME_NOTES, sp: 26, pps: 560, play: (playX + 400) / (W + 800), lyrics: LYRICS, ts: t + whip });
+  ctx.restore();
+  font(ctx, 42, 'ui'); ctx.fillStyle = GRAY;
+  ctx.fillText('R.H.', 60, STAFF_FULL.trebleTop + 2 * 26 + 12);
+  ctx.fillText('L.H.', 60, STAFF_FULL.bassTop + 2 * 26 + 12);
+}
+
+// ---- scene 3: machine (20-30 s) ---------------------------------------------------------------------------
+const DEV_NOTES = NOTES.filter((n) => n.t >= 19.5 && n.t < 30.5);
+function scene3a(ctx, t) {
+  drawRadial(ctx, W / 2, H / 2, 1080, t, { notes: DEV_NOTES, labels: true, tag: true });
+}
+function drawKeys(ctx, t, yaw, pitch, scale, notes) {
+  const unit = 34 * scale;
+  const boxes = [];
+  for (let m = 21; m <= 108; m++) {
+    const i = m - 21;
+    const black = isBlack(m);
+    let e = 0;
+    for (const n of BY_PITCH.get(m) || []) { if (n.t > t) break; if (t - n.t < 3) e += energy(n, t); }
+    const h = (black ? 1.4 : 0.8) + 18 * e;
+    const x = (i - 44) * unit, z0 = black ? 1.2 * unit : 0, z1 = black ? 3.4 * unit : 4.2 * unit;
+    boxes.push({ x0: x, x1: x + unit * 0.86, z0, z1, h: h * unit, e, black, m });
+  }
+  const faces = [];
+  for (const b of boxes) {
+    const P = (x, y, z) => cam([x, -y + 260, z - 2 * unit], yaw, pitch, 700, 1500);
+    const top = [P(b.x0, b.h, b.z0), P(b.x1, b.h, b.z0), P(b.x1, b.h, b.z1), P(b.x0, b.h, b.z1)];
+    const front = [P(b.x0, 0, b.z0), P(b.x1, 0, b.z0), P(b.x1, b.h, b.z0), P(b.x0, b.h, b.z0)];
+    const side = [P(b.x1, 0, b.z0), P(b.x1, 0, b.z1), P(b.x1, b.h, b.z1), P(b.x1, b.h, b.z0)];
+    const side2 = [P(b.x0, 0, b.z0), P(b.x0, 0, b.z1), P(b.x0, b.h, b.z1), P(b.x0, b.h, b.z0)];
+    const base = b.black ? GRAY : PAPER;
+    const topCol = mix(base, ACCENT, clamp(b.e * 2.5));
+    const depth = (q) => q.reduce((s, p) => s + p[2], 0) / 4;
+    faces.push({ q: side, c: mix(topCol, INK, 0.6), d: depth(side) });
+    faces.push({ q: side2, c: mix(topCol, INK, 0.6), d: depth(side2) });
+    faces.push({ q: front, c: mix(topCol, INK, 0.38), d: depth(front) });
+    faces.push({ q: top, c: topCol, d: depth(top) - 0.01 });
+  }
+  faces.sort((a, b) => b.d - a.d);
+  for (const f of faces) {
+    ctx.fillStyle = f.c;
+    ctx.beginPath(); f.q.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.fill();
+  }
+  return boxes;
+}
+function scene3b(ctx, t) {
+  const p = prog(t, 22.5, 25);
+  drawKeys(ctx, t, lerp(-0.55, -0.28, E.cubicInOut(p)), lerp(0.62, 0.5, p), 1, DEV_NOTES);
+  font(ctx, 42, 'ui'); ctx.fillStyle = GRAY2;
+  ctx.fillText(typed('88 keys · height = how hard, how recent', prog(t, 22.7, 23.5)), 140, 930);
+}
+const KALEIDO = document.createElement('canvas'); KALEIDO.width = KALEIDO.height = 1080;
+function scene3c(ctx, t) {
+  const k = KALEIDO.getContext('2d');
+  k.setTransform(1, 0, 0, 1, 0, 0);
+  k.fillStyle = INK; k.fillRect(0, 0, 1080, 1080);
+  drawRadial(k, 540, 540, 1080, t, { notes: DEV_NOTES });
+  const kicks = PERC.filter((p) => p.kind === 'kick' && p.t <= t && p.t > 24).reduce((s, p) => s + E.expoOut(clamp((t - p.t) / 0.3)), 0);
+  const spin = (t - 25) * 0.25 + kicks * 0.18;
+  const wedges = 8;
+  for (let i = 0; i < wedges; i++) {
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(spin + (i * TAU) / wedges);
+    if (i % 2) ctx.scale(1, -1);
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, 1200, 0, TAU / wedges + 0.004); ctx.closePath(); ctx.clip();
+    ctx.drawImage(KALEIDO, -540, -540);
+    ctx.restore();
+  }
+}
+function scene3d(ctx, t) {
+  const zoom = E.expoInOut(prog(t, 27.6, 28.9));
+  const half = lerp(1.4, 30, zoom), center = lerp(t, 30, zoom);
+  const v0 = center - half, v1 = center + half;
+  const X = (time) => 140 + ((time - v0) / (v1 - v0)) * 1640;
+  const Y = (m) => 900 - ((m - 21) / (100 - 21)) * 740;
+  const collapse = E.expoIn(prog(t, 29.25, 29.85));
+  const px = X(t);
+  for (const n of NOTES) {
+    let x = X(n.t), w = Math.max(3, X(n.t + n.d) - x);
+    if (x > W + 50 || x + w < -50) continue;
+    let y = Y(n.m);
+    x = lerp(x, px, collapse); y = lerp(y, 540, collapse); w = lerp(w, 2, collapse);
+    ctx.fillStyle = t >= n.t && t < n.end ? ACCENT : n.t <= t ? PAPER : GRAY;
+    ctx.fillRect(x, y - 4, w, 8);
+  }
+  if (collapse < 0.5) { ctx.fillStyle = ACCENT; ctx.fillRect(px - 1.5, 140, 3, 790); }
+  if (zoom > 0.98 && collapse < 0.2) {
+    font(ctx, 42, 'ui'); ctx.fillStyle = GRAY2;
+    SCORE.sections.forEach((s, i) => ctx.fillText(typed(s.name, prog(t, 28.9 + i * 0.05, 29.1 + i * 0.05)), X(s.t) + 4, 120));
+    ctx.fillStyle = PAPER;
+    ctx.fillText(typed(`${NOTES.length} notes · ${PERC.length} hits · one take`, prog(t, 28.9, 29.3)), 140, 990);
+  }
+  const grow = E.expoIn(prog(t, 29.7, 30.0));
+  if (grow > 0) { ctx.fillStyle = PAPER; ctx.beginPath(); ctx.arc(px, 540, grow * 2300, 0, TAU); ctx.fill(); }
+}
+
+// ---- scene 4: breath (30-40 s) ------------------------------------------------------------------------------
+const BREATH = NOTES.filter((n) => n.t >= 29.9 && n.t < 37.4 && (n.voice === 'high' || n.voice === 'bass'));
+const DROPS = BREATH.map((n) => {
+  const r = mulberry32(n.i * 7 + 3);
+  return n.voice === 'high'
+    ? { n, x: 760 + ((n.m - 74) / (93 - 74)) * 960 + (r() - 0.5) * 120, y: 420 + r() * 420, speed: 230, rings: 5 }
+    : { n, x: 1300, y: 1010, speed: 150, rings: 3 };
+});
+function ripple(ctx, x, y, dt, speed, rings, color, squash = 0.36, spacing = 30) {
+  for (let k = 0; k < rings; k++) {
+    const r = dt * speed - k * spacing;
+    if (r <= 0) continue;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = clamp(Math.exp(-dt / 1.9) * (1 - k * 0.16));
+    ctx.lineWidth = 2.2;
+    ctx.beginPath(); ctx.ellipse(x, y, r, r * squash, 0, 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function scene4(ctx, t) {
+  ctx.fillStyle = PAPER; ctx.fillRect(-60, -60, W + 120, H + 120);
+  for (const d of DROPS) {
+    const dt = t - d.n.t;
+    if (dt < -0.42 || dt > 7) continue;
+    if (dt < 0) { // the drop falls and lands exactly on the note
+      const p = 1 - -dt / 0.42;
+      ctx.fillStyle = INK;
+      ctx.beginPath(); ctx.ellipse(d.x, d.y - 320 * (1 - p * p), 6, 9, 0, 0, TAU); ctx.fill();
+    } else ripple(ctx, d.x, d.y, dt, d.speed, d.rings, INK);
+  }
+  // Tremolo: accelerating pulses at the center while the reversed swell pulls rings inward.
+  const trem = NOTES.filter((n) => n.voice === 'tremolo' && n.t <= t && t - n.t < 1.5);
+  for (const n of trem) ripple(ctx, W / 2, 600, t - n.t, 420, 1, INK, 0.36);
+  const sw = prog(t, 37.4, 40);
+  if (sw > 0) {
+    for (let k = 0; k < 9; k++) {
+      const r = (40 - t) * 520 + k * 46;
+      if (r <= 0 || r > 2400) continue;
+      ctx.strokeStyle = INK; ctx.globalAlpha = clamp(sw * 1.5) * (1 - k / 10); ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.ellipse(W / 2, 600, r, r * 0.36, 0, 0, TAU); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    const hole = E.expoIn(prog(t, 38.9, 40.0));
+    ctx.fillStyle = INK;
+    ctx.beginPath(); ctx.ellipse(W / 2, 600, hole * 2300, hole * 2300 * lerp(0.36, 1, hole), 0, 0, TAU); ctx.fill();
+  }
+  maskedWord(ctx, 'Silence', 140, 300, 170, 'italic', 30.05, 37.6, t, INK);
+  maskedWord(ctx, 'is a', 140, 460, 170, 'italic', 32.55, 37.65, t, INK);
+  maskedWord(ctx, 'material.', 140, 620, 170, 'italic', 35.05, 37.7, t, ACCENT);
+  if (t < 37.7) {
+    font(ctx, 42, 'ui'); ctx.fillStyle = GRAY;
+    ctx.fillText(typed('una corda · pianissimo · 8 notes in 7.5 s', prog(t, 30.6, 31.6)), 146, 720);
+  }
+}
+
+// ---- scene 5: climax (40-55 s) ------------------------------------------------------------------------------
+const CLIMAX_NOTES = NOTES.filter((n) => n.t >= 39.5 && n.t < 55.2);
+function scene5a(ctx, t) {
+  // A five-octave keyboard in perspective; keys go down on the real notes.
+  const lo = 36, hi = 96;
+  const whites = []; for (let m = lo; m <= hi; m++) if (!isBlack(m)) whites.push(m);
+  const kw = 1;
+  const nearY = 1010, farY = 430, push = 1 + 0.06 * E.cubicInOut(prog(t, 40, 42.5));
+  const P = (u, v) => { // u: 0..1 across, v: 0 near .. 1 far
+    const s = lerp(1, 0.72, v);
+    return [W / 2 + (u - 0.5) * 1960 * s * push, lerp(nearY, farY, v) * 1 + (push - 1) * 300];
+  };
+  const press = (m) => { let e = 0; for (const n of BY_PITCH.get(m) || []) { if (n.t > t) break; if (t < n.end && t - n.t < 3) e = Math.max(e, 1 - Math.exp(-(t - n.t) / 0.015)); } return e; };
+  const keyPoly = (u0, u1, v0, v1, dy) => [P(u0, v0), P(u1, v0), P(u1, v1), P(u0, v1)].map(([x, y]) => [x, y + dy]);
+  const fillPoly = (q, c) => { ctx.fillStyle = c; ctx.beginPath(); q.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.fill(); };
+  whites.forEach((m, i) => {
+    const u0 = i / whites.length, u1 = (i + 0.94) / whites.length;
+    const pr = press(m);
+    fillPoly(keyPoly(u0, u1, 0, 1, pr * 10), mix(PAPER, ACCENT, pr));
+    const [a, b] = [P(u0, 0), P(u1, 0)];
+    ctx.fillStyle = mix(GRAY2, ACCENT, pr * 0.7);
+    ctx.fillRect(a[0], a[1] + pr * 10, b[0] - a[0], 26 - pr * 10);
+  });
+  whites.forEach((m, i) => {
+    if (!isBlack(m + 1) || m + 1 > hi) return;
+    const u = (i + 0.97) / whites.length, w = 0.58 / whites.length;
+    const pr = press(m + 1);
+    fillPoly(keyPoly(u - w / 2, u + w / 2, 0.38, 1, -16 + pr * 10), mix('#1d1c1a', ACCENT, pr));
+  });
+  maskedWord(ctx, 'fortissimo.', 140, 300, 190, 'italic', 40.02, 42.2, t, PAPER, 0.03);
+}
+function stringsBox(ctx, box, t, pitches, amp = 80) {
+  pitches.forEach((m, rank) => {
+    const y = box.y + box.h * 0.12 + (1 - rank / (pitches.length - 1)) * box.h * 0.76;
+    const c = stringCoeffs(m, t);
+    const pts = [];
+    for (let i = 0; i <= 60; i++) { const u = i / 60; pts.push([box.x + 30 + u * (box.w - 60), y + dispAt(c, u) * amp]); }
+    drawString(ctx, pts, pitchEnergy(m, t), 2.5);
+  });
+}
+const CLIMAX_PITCHES = [...new Set(CLIMAX_NOTES.filter((n) => n.m >= 50 && n.m <= 89).map((n) => n.m))].sort((a, b) => a - b);
+function scene5b(ctx, t) {
+  scene5a(ctx, t);
+  const panels = [0, 1, 2].map((k) => ({ x: k * 640 + (k ? 6 : 0), y: 0, w: 640 - (k === 1 ? 12 : 6), h: H, at: 42.5 + k * BEAT }));
+  panels.forEach((p, k) => {
+    const s = E.expoOut(prog(t, p.at, p.at + 0.4));
+    if (s <= 0) return;
+    ctx.save();
+    ctx.translate(0, (1 - s) * H);
+    ctx.beginPath(); ctx.rect(p.x, p.y, p.w, p.h); ctx.clip();
+    ctx.fillStyle = INK; ctx.fillRect(p.x, p.y, p.w, p.h);
+    if (k === 0) stringsBox(ctx, p, t, CLIMAX_PITCHES);
+    if (k === 1) drawStaff(ctx, p, t, { notes: CLIMAX_NOTES, sp: 16, pps: 380, play: 0.3 });
+    if (k === 2) drawRadial(ctx, p.x + p.w / 2, H / 2, 620, t, { notes: CLIMAX_NOTES });
+    ctx.restore();
+  });
+}
+const WORD_NOTES = CLIMAX_NOTES.filter((n) => n.voice === 'melody' && n.t >= 44.9 && n.t < 47.5 && n.m >= 72);
+const WORDS = ['the', 'mu–', 'sic', 'moves.'];
+const WORD_STYLE = [[ACCENT, INK], [INK, PAPER], [PAPER, INK], [INK, ACCENT]];
+function scene5c(ctx, t) {
+  let k = 0;
+  WORD_NOTES.forEach((n, i) => { if (t >= n.t - 0.001) k = i; });
+  const n = WORD_NOTES[k];
+  const [bg, fg] = WORD_STYLE[k];
+  ctx.fillStyle = bg; ctx.fillRect(-60, -60, W + 120, H + 120);
+  const word = WORDS[k];
+  const size = Math.min(760, fitSize(ctx, word, 1560, 'italic'));
+  const l = layout(ctx, word, size, 'italic');
+  const p = E.expoOut(prog(t, n.t, n.t + 0.15));
+  ctx.save();
+  ctx.translate(180, 540 + l.asc * 0.42);
+  const s = lerp(1.05, 1, p);
+  ctx.scale(s, s);
+  ctx.translate((t - n.t) * -16, 0);
+  font(ctx, size, 'italic'); ctx.fillStyle = fg;
+  ctx.fillText(word, 0, 0);
+  ctx.restore();
+  font(ctx, 42, 'ui'); ctx.fillStyle = fg;
+  ctx.fillText(`${pitchName(n.m)} · ${hz(n.m).toFixed(1)} Hz`, 186, 540 - l.asc * 0.62 - 30);
+}
+function scene5d(ctx, t) {
+  // Tunnel: one square per sixteenth, arriving exactly as its note sounds.
+  const roll = (t - 47.5) * 0.5;
+  const boost = 1 + E.expoIn(prog(t, 49.0, 50)) * 1.5;
+  const rings = CLIMAX_NOTES.filter((n) => (n.voice === 'arp' || (n.voice === 'melody' && n.m >= 72)) && n.t > t - 0.35 && n.t < t + 2.2);
+  rings.sort((a, b) => b.t - a.t);
+  for (const n of rings) {
+    const z = 420 + (n.t - t) * 2600 * boost;
+    if (z < 40) continue;
+    const s = 800 / z;
+    const mel = n.voice === 'melody';
+    const R = (mel ? 760 : 300 + (n.m - 60) * 7) * s;
+    const fresh = t >= n.t && t - n.t < 0.18;
+    ctx.save();
+    ctx.translate(W / 2 + Math.sin(n.t * 2.1) * 60 * s, H / 2 + Math.cos(n.t * 1.7) * 40 * s);
+    ctx.rotate(roll + n.t * 0.35);
+    ctx.strokeStyle = mel || fresh ? ACCENT : mix(GRAY, PAPER, clamp(s * 1.2));
+    ctx.lineWidth = Math.max(1, (mel ? 7 : 2.5) * s);
+    ctx.strokeRect(-R, -R, R * 2, R * 2);
+    ctx.restore();
+  }
+}
+function scene5e(ctx, t) {
+  // Six-fold mandala of vibrating strings, one spoke per pitch class.
+  const kicks = PERC.filter((p) => p.kind === 'kick' && p.t <= t && p.t > 49.5).reduce((s, p) => s + E.expoOut(clamp((t - p.t) / 0.35)), 0);
+  const spin = (t - 50) * 0.3 + kicks * 0.16;
+  const pitches = [...new Set(CLIMAX_NOTES.filter((n) => n.t > 49 && n.t < 53).map((n) => n.m))];
+  for (let k = 0; k < 6; k++) {
+    for (const m of pitches) {
+      const e = pitchEnergy(m, t);
+      const a = spin + (k * TAU) / 6 + ((m % 12) / 12) * (TAU / 6) + Math.floor(m / 12) * 0.05;
+      const c = stringCoeffs(m, t);
+      const r0 = 70, r1 = 200 + (m - 30) * 6.6;
+      const pts = [];
+      for (let i = 0; i <= 40; i++) {
+        const u = i / 40, r = lerp(r0, r1, u), d = dispAt(c, u) * 60;
+        pts.push([W / 2 + Math.cos(a) * r - Math.sin(a) * d, H / 2 + Math.sin(a) * r + Math.cos(a) * d]);
+      }
+      drawString(ctx, pts, e, 2.5);
+    }
+  }
+  const kick = PERC.filter((p) => p.kind === 'kick' && p.t <= t && t - p.t < 0.5).reduce((s, p) => s + p.v * Math.exp(-(t - p.t) * 8), 0);
+  ctx.fillStyle = ACCENT; ctx.beginPath(); ctx.arc(W / 2, H / 2, 36 + 34 * kick, 0, TAU); ctx.fill();
+}
+const ALL_PITCHES = [...BY_PITCH.keys()].filter((m) => m >= 33).sort((a, b) => a - b);
+function scene5f(ctx, t) {
+  // The whole instrument as a harp in depth, in slow motion.
+  const p = prog(t, 52.5, 55);
+  const yaw = lerp(-0.5, -0.22, E.cubicInOut(p));
+  const N = ALL_PITCHES.length;
+  const strings = ALL_PITCHES.map((m, i) => ({ m, i, x: (i - N / 2) * 62 }));
+  const proj = strings.map((s) => ({ s, d: cam([s.x, 0, 0], yaw, 0.1, 900, 1300)[2] })).sort((a, b) => b.d - a.d);
+  for (const { s } of proj) {
+    const c = stringCoeffs(s.m, t, 0.45);
+    const len = 1300 - (s.m - 33) * 9;
+    const pts = [];
+    for (let i = 0; i <= 50; i++) {
+      const u = i / 50;
+      pts.push(cam([s.x + dispAt(c, u) * 90, -len / 2 + u * len + 60, 0], yaw, 0.1, 900, 1300));
+    }
+    drawString(ctx, pts, pitchEnergy(s.m, t), 2.5);
+  }
+  font(ctx, 42, 'ui'); ctx.fillStyle = GRAY2;
+  ctx.fillText(typed(`${ALL_PITCHES.length} strings · every pitch in the piece`, prog(t, 52.7, 53.6)), 140, 980);
+}
+
+// ---- scene 6: coda (55-60 s) ----------------------------------------------------------------------------------
+const CODA_PITCHES = [...new Set(NOTES.filter((n) => n.voice === 'coda').map((n) => n.m))].sort((a, b) => a - b);
+function scene6(ctx, t) {
+  CODA_PITCHES.forEach((m) => {
+    const first = BY_PITCH.get(m).find((n) => n.voice === 'coda').t;
+    const grow = E.expoOut(prog(t, first - 0.12, first + 0.35));
+    if (grow <= 0) return;
+    const y = yOfPitch(m) + 40;
+    const sx = 140 + 1640 * STRIKE;
+    const x0 = lerp(sx, 140, grow), x1 = lerp(sx, 1780, grow);
+    const still = t > PEDAL_OFF ? Math.exp(-(t - PEDAL_OFF) / 0.05) : 1;
+    const c = stringCoeffs(m, t).map((v) => v * still);
+    const pts = [];
+    for (let i = 0; i <= 96; i++) {
+      const u = i / 96;
+      const ux = (lerp(x0, x1, u) - 140) / 1640;
+      pts.push([lerp(x0, x1, u), y + dispAt(c, clamp(ux)) * 150]);
+    }
+    drawString(ctx, pts, pitchEnergy(m, t) * still, 3);
+    const hm = hammerOffset(m, t);
+    if (hm) { ctx.fillStyle = ACCENT; ctx.fillRect(sx - 14, y + hm.off, 28, 44 - hm.gone * 44 + 3); }
+  });
+  // Lockup: knocked out of the strings so it reads cleanly.
+  const l = layout(ctx, 'Claude', 300, 'italic');
+  const reveal = E.expoOut(prog(t, 56.25, 57.1));
+  if (reveal > 0) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 560 - l.asc * 1.3, W, l.asc * 1.3 + 90); ctx.clip();
+    font(ctx, 300, 'italic');
+    const y = 560 + (1 - reveal) * 360;
+    ctx.lineWidth = 22; ctx.strokeStyle = INK; ctx.lineJoin = 'round';
+    ctx.strokeText('Claude', 130, y);
+    ctx.fillStyle = PAPER; ctx.fillText('Claude', 130, y);
+    ctx.restore();
+  }
+  font(ctx, 40, 'ui');
+  const lines = [
+    { text: 'motion & sound — étude no. 1', at: 57.4, col: PAPER },
+    { text: '60 s · 1 piano · 0 samples · every frame in code', at: 58.0, col: GRAY2 },
+  ];
+  lines.forEach((ln, i) => {
+    const p = prog(t, ln.at, ln.at + 0.6);
+    if (p <= 0) return;
+    const y = 660 + i * 58;
+    const s = typed(ln.text, p);
+    const w = ctx.measureText(s).width;
+    ctx.fillStyle = INK; ctx.fillRect(136, y - 40, w + 12, 54);
+    ctx.fillStyle = ln.col; ctx.fillText(s, 142, y);
+  });
+}
+
+// ---- timeline -----------------------------------------------------------------------------------------------
+const SCENES = [
+  [0, scene1], [10, scene2], [20, scene3a], [22.5, scene3b], [25, scene3c], [27.5, scene3d], [30, scene4],
+  [40, scene5a], [42.5, scene5b], [45, scene5c], [47.5, scene5d], [50, scene5e], [52.5, scene5f], [55, scene6],
+];
+const CUTS = [...SCENES.slice(1).map((s) => s[0]), ...WORD_NOTES.slice(1).map((n) => n.t)].sort((a, b) => a - b);
+const lastCut = (t) => CUTS.reduce((m, c) => (c <= t + 1e-6 ? c : m), -Infinity);
+
+function shake(t) {
+  let x = 0, y = 0;
+  BOOMS.forEach((b, i) => {
+    const dt = t - b;
+    if (dt < 0) return;
+    const a = [8, 7, 12, 26, 10][i] * Math.exp(-dt * 7);
+    x += a * noise1(dt * 30 + i * 50); y += a * noise1(dt * 30 + i * 50 + 300);
+  });
+  if (t > 40 && t < 55) {
+    for (const p of PERC) {
+      if (p.kind !== 'kick' || p.t > t) continue;
+      const dt = t - p.t; if (dt > 0.3) continue;
+      y += 4 * p.v * Math.exp(-dt * 14) * Math.cos(dt * 60);
+    }
+  }
+  return [x, y];
+}
+function draw(ctx, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+  const [sx, sy] = shake(t);
+  ctx.translate(sx, sy);
+  let scene = SCENES[0][1];
+  for (const [start, fn] of SCENES) if (t >= start) scene = fn;
+  scene(ctx, t);
+}
+
+const GRAIN = (() => {
+  const r = mulberry32(99);
+  return [0, 1, 2].map(() => {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d'), img = g.createImageData(256, 256);
+    for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+    g.putImageData(img, 0, 0);
+    return c;
+  });
+})();
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const acc = document.createElement('canvas'); acc.width = W; acc.height = H;
+const actx = acc.getContext('2d');
+const SHUTTER = 1 / 60;
+const SAMPLES = window.RENDER ? 5 : 1;
+
+window.seek = function (t) {
+  if (SAMPLES === 1) draw(ctx, t);
+  else {
+    for (let i = 0; i < SAMPLES; i++) {
+      draw(actx, Math.max(lastCut(t), t - SHUTTER * (1 - i / (SAMPLES - 1))));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1 / (i + 1);
+      ctx.drawImage(acc, 0, 0);
+    }
+  }
+  const frame = Math.round(t * 30);
+  const r = mulberry32(frame + 1);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 0.06;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = ctx.createPattern(GRAIN[frame % 3], 'repeat');
+  ctx.translate(-r() * 256, -r() * 256);
+  ctx.fillRect(0, 0, W + 256, H + 256);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+};
+
+window.READY = Promise.all([
+  document.fonts.load('400 100px Serif'), document.fonts.load('italic 400 100px Serif'), document.fonts.load('500 30px UI'),
+]);
+
+if (!window.RENDER) {
+  const audio = new Audio('audio.wav');
+  document.body.addEventListener('click', () => { audio.currentTime = 0; audio.play(); });
+  window.READY.then(() => {
+    const loop = () => { seek(audio.paused ? (performance.now() / 1000) % window.DURATION : audio.currentTime); requestAnimationFrame(loop); };
+    loop();
+  });
+}
+</script>
+</body>
+</html>
