@@ -30,7 +30,7 @@ const beatsFile = join(filmDir, 'beats.json');
 
 // Two-pass loudnorm: measure first, then apply linearly so the result lands on -14 LUFS.
 async function loudnormFilter(file) {
-  const target = 'I=-14:TP=-1:LRA=11';
+  const target = 'I=-14:TP=-2:LRA=11'; // 2 dB headroom: AAC encoding adds inter-sample overs
   const proc = spawn('ffmpeg', ['-hide_banner', '-i', file, '-af', `loudnorm=${target}:print_format=json`, '-f', 'null', '-']);
   let log = '';
   proc.stderr.on('data', (d) => { log += d; });

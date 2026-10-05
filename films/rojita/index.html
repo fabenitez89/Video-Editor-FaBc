@@ -1,0 +1,662 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rojita</title>
+<style>
+  @font-face { font-family: 'Display'; src: url(fonts/bricolage-800.woff2) format('woff2'); font-weight: 800; }
+  @font-face { font-family: 'UI'; src: url(fonts/jetbrains-mono-500.woff2) format('woff2'); font-weight: 500; }
+  html, body { margin: 0; background: #120f14; }
+  canvas { display: block; width: 100vw; height: auto; }
+</style>
+<script src="cues.js"></script>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Rojita: 30 s of kinetic type and a 3D microscope that comes apart and goes back together.
+// Every event time comes from cues.js, the same sheet the sound was built from.
+const W = 1920, H = 1080;
+window.DURATION = 30;
+const C = window.CUES;
+
+const INK = '#120f14', PAPER = '#f7efe6', ACCENT = '#ff3b4e', GRAY = '#4b4550', GRAY2 = '#b4abb6', METAL = '#77717f';
+
+// ---- math -----------------------------------------------------------------------------------
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, x) => a + (b - a) * x;
+const prog = (x, a, b) => clamp((x - a) / (b - a));
+const E = {
+  expoOut: (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x)),
+  expoIn: (x) => (x <= 0 ? 0 : Math.pow(2, 10 * x - 10)),
+  expoInOut: (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x < 0.5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2),
+  cubicInOut: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+  backOut: (x, s = 1.9) => 1 + (s + 1) * Math.pow(x - 1, 3) + s * Math.pow(x - 1, 2),
+  bounce: (x) => {
+    const n = 7.5625, d = 2.75;
+    if (x < 1 / d) return n * x * x;
+    if (x < 2 / d) return n * (x -= 1.5 / d) * x + 0.75;
+    if (x < 2.5 / d) return n * (x -= 2.25 / d) * x + 0.9375;
+    return n * (x -= 2.625 / d) * x + 0.984375;
+  },
+  spring: (x, k = 20, z = 0.3) => (x <= 0 ? 0 : 1 - Math.exp(-z * k * x) * Math.cos(k * Math.sqrt(1 - z * z) * x)),
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const NOISE = (() => { const r = mulberry32(5); return Array.from({ length: 512 }, () => r() * 2 - 1); })();
+function noise1(x) { const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f); return lerp(NOISE[((i % 512) + 512) % 512], NOISE[(((i + 1) % 512) + 512) % 512], s); }
+function hex(c) { return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); }
+function mix(a, b, x) { const pa = hex(a), pb = hex(b); return `rgb(${pa.map((v, i) => Math.round(lerp(v, pb[i], clamp(x)))).join(',')})`; }
+// Spring that starts at cue time c: 0 before, overshoots, settles at 1.
+const springAt = (t, c, dur = 0.6) => (t < c ? 0 : E.spring(clamp((t - c) / dur)));
+
+// ---- type ---------------------------------------------------------------------------------------
+function font(ctx, size, ui = false) { ctx.font = ui ? `500 ${size}px UI` : `800 ${size}px Display`; }
+const layoutCache = new Map();
+function layout(ctx, text, size, ui = false, track = -0.02) {
+  const key = `${text}|${size}|${ui}|${track}`;
+  if (layoutCache.has(key)) return layoutCache.get(key);
+  font(ctx, size, ui);
+  let x = 0;
+  const letters = [];
+  for (const ch of text) { const w = ctx.measureText(ch).width; letters.push({ ch, x, w }); x += w + track * size; }
+  const out = { letters, width: x - track * size, asc: ctx.measureText('H').actualBoundingBoxAscent };
+  layoutCache.set(key, out);
+  return out;
+}
+const typed = (text, p) => text.slice(0, Math.floor([...text].length * clamp(p) + 1e-6));
+
+// A word that slams in from a direction at cue c.
+function slamWord(ctx, word, x, y, size, c, t, dir, color) {
+  const p = E.expoOut(prog(t, c, c + 0.32));
+  if (p <= 0) return 0;
+  const l = layout(ctx, word, size);
+  const [dx, dy] = [[-1, 0], [1, 0], [0, -1], [0, 1]][dir % 4];
+  ctx.save();
+  ctx.translate(x + dx * (1 - p) * 900, y + dy * (1 - p) * 500);
+  const sq = springAt(t, c + 0.18, 0.5);
+  ctx.translate(l.width / 2, 0); ctx.scale(1 + (1 - sq) * 0.12 * (t > c + 0.18 ? 1 : 0), 1); ctx.translate(-l.width / 2, 0);
+  font(ctx, size); ctx.fillStyle = color;
+  ctx.fillText(word, 0, 0);
+  ctx.restore();
+  return l.width;
+}
+function popWord(ctx, word, x, y, size, c, t, color, rot = 0) {
+  const p = t < c ? 0 : E.backOut(clamp((t - c) / 0.35), 2.4);
+  if (p <= 0) return 0;
+  const l = layout(ctx, word, size);
+  ctx.save();
+  ctx.translate(x + l.width / 2, y - l.asc / 2);
+  ctx.rotate(rot * (1 - clamp((t - c) / 0.35)));
+  ctx.scale(p, p);
+  font(ctx, size); ctx.fillStyle = color;
+  ctx.fillText(word, -l.width / 2, l.asc / 2);
+  ctx.restore();
+  return l.width;
+}
+
+// ---- 3D engine -----------------------------------------------------------------------------------------
+function rotX(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]; }
+function rotY(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]; }
+function rotZ(v, a) { const c = Math.cos(a), s = Math.sin(a); return [v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2]]; }
+const rot3 = (v, r) => rotZ(rotY(rotX(v, r[0]), r[1]), r[2]);
+const add3 = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const scl3 = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+function norm3(a) { const m = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / m, a[1] / m, a[2] / m]; }
+
+function box(cx, cy, cz, w, h, d, color) {
+  const x0 = cx - w / 2, x1 = cx + w / 2, y0 = cy - h / 2, y1 = cy + h / 2, z0 = cz - d / 2, z1 = cz + d / 2;
+  const q = (pts, n) => ({ p: pts, n, color });
+  return [
+    q([[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0]], [0, 0, -1]),
+    q([[x1, y0, z1], [x0, y0, z1], [x0, y1, z1], [x1, y1, z1]], [0, 0, 1]),
+    q([[x0, y0, z1], [x0, y0, z0], [x0, y1, z0], [x0, y1, z1]], [-1, 0, 0]),
+    q([[x1, y0, z0], [x1, y0, z1], [x1, y1, z1], [x1, y1, z0]], [1, 0, 0]),
+    q([[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]], [0, 1, 0]),
+    q([[x0, y0, z1], [x1, y0, z1], [x1, y0, z0], [x0, y0, z0]], [0, -1, 0]),
+  ];
+}
+// Cylinder or cone along an axis ('x' or 'y'), r0 at the low end, r1 at the high end.
+function cyl(axis, cx, cy, cz, r0, r1, len, color, seg = 28, capColor = null) {
+  const map = (a, r, s) => (axis === 'y' ? [cx + Math.cos(a) * r, cy + s, cz + Math.sin(a) * r] : [cx + s, cy + Math.cos(a) * r, cz + Math.sin(a) * r]);
+  const nrm = (a) => (axis === 'y' ? [Math.cos(a), (r0 - r1) / len, Math.sin(a)] : [(r0 - r1) / len, Math.cos(a), Math.sin(a)]);
+  const faces = [];
+  for (let i = 0; i < seg; i++) {
+    const a0 = (i / seg) * TAU, a1 = ((i + 1) / seg) * TAU, am = (a0 + a1) / 2;
+    faces.push({ p: [map(a0, r0, -len / 2), map(a1, r0, -len / 2), map(a1, r1, len / 2), map(a0, r1, len / 2)], n: norm3(nrm(am)), color });
+  }
+  const capLo = [], capHi = [];
+  for (let i = 0; i < seg; i++) { const a = (i / seg) * TAU; capLo.push(map(a, r0, -len / 2)); capHi.push(map(a, r1, len / 2)); }
+  faces.push({ p: capLo.reverse(), n: axis === 'y' ? [0, -1, 0] : [-1, 0, 0], color: capColor || color });
+  faces.push({ p: capHi, n: axis === 'y' ? [0, 1, 0] : [1, 0, 0], color: capColor || color });
+  return faces;
+}
+
+const LIGHT = norm3([-0.55, 0.8, -0.6]);
+// Render faces: world (y up) -> camera. cam: {yaw, pitch, dist, F, cx, cy, scale}
+function renderFaces(ctx, faces, cam) {
+  const out = [];
+  for (const f of faces) {
+    const pts = f.p.map((v) => rotX(rotY(v, cam.yaw), cam.pitch));
+    const n = rotX(rotY(f.n, cam.yaw), cam.pitch);
+    const c = pts.reduce((s, p) => add3(s, p), [0, 0, 0]).map((v) => v / pts.length);
+    const view = sub3(c, [0, 0, -cam.dist]);
+    if (dot3(n, view) >= 0) continue;
+    // Key light plus a cool fill from below-right; wide range so enamel reads as a solid.
+    const key = Math.max(0, dot3(n, LIGHT));
+    const fill = Math.max(0, dot3(n, norm3([0.7, -0.1, -0.7]))) * 0.4;
+    const bounce = Math.max(0, -n[1]) * 0.3; // light coming back off the floor
+    const lit = 0.3 + 0.7 * Math.pow(key, 1.4) + fill + bounce;
+    const spec = Math.pow(Math.max(0, dot3(n, norm3([-0.2, 0.5, -1]))), 30) * 0.45;
+    out.push({ pts, z: c[2], col: f.alpha ? f.color : mix(mix(INK, f.color, lit), '#ffffff', spec), alpha: f.alpha || 1, edge: f.color });
+  }
+  out.sort((a, b) => b.z - a.z);
+  for (const f of out) {
+    ctx.beginPath();
+    f.pts.forEach((p, i) => {
+      const s = (cam.F / (p[2] + cam.dist)) * cam.scale;
+      const x = cam.cx + p[0] * s, y = cam.cy - p[1] * s;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.closePath();
+    ctx.globalAlpha = f.alpha;
+    ctx.fillStyle = f.col; ctx.strokeStyle = f.col; ctx.lineWidth = 1;
+    ctx.fill(); ctx.stroke();
+    if (f.pts.length === 4 && f.edge !== ACCENT) { // crisp silhouette edges on box faces
+      ctx.strokeStyle = 'rgba(18,15,20,0.55)'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+function project(v, cam) {
+  const p = rotX(rotY(v, cam.yaw), cam.pitch);
+  const s = (cam.F / (p[2] + cam.dist)) * cam.scale;
+  return [cam.cx + p[0] * s, cam.cy - p[1] * s, s];
+}
+
+// ---- the microscope ---------------------------------------------------------------------------------------
+const AX = -40; // optical axis z
+const part = (name, label, faces, explode, spin = [0, 0, 0]) => {
+  const all = faces.flat(Infinity);
+  const c = all.reduce((s, f) => add3(s, f.p.reduce((q, p) => add3(q, p), [0, 0, 0]).map((v) => v / f.p.length)), [0, 0, 0]).map((v) => v / all.length);
+  return { name, label, faces: all, center: c, explode, spin };
+};
+const objectives = [0, 1, 2].map((k) => {
+  const a = -Math.PI / 2 + (k - 1) * 0.95, L = [46, 62, 78][k];
+  const x = Math.cos(a) * 34, z = AX + Math.sin(a) * 34;
+  return [cyl('y', x, 304 - L / 2, z, 12, 16, L, METAL, 18), cyl('y', x, 304 - L * 0.62, z, 17, 17, 7, ACCENT, 18)];
+});
+const PARTS = [
+  part('ocular', 'ocular', [cyl('y', 0, 494, AX, 24, 24, 52, METAL), cyl('y', 0, 525, AX, 29, 29, 11, '#2a2730', 28, '#151317')], [0, 320, 0], [0, 0, 0.5]),
+  part('tubo', 'tubo', [cyl('y', 0, 400, AX, 34, 34, 136, PAPER)], [-40, 200, -120], [0.3, 0, 0]),
+  part('objetivos', 'objetivos', objectives, [-60, -40, -300], [0.6, 0, 0]),
+  part('revolver', 'revólver', [cyl('y', 0, 318, AX, 70, 50, 28, METAL)], [-300, 80, -100], [0, 1.4, 0.3]),
+  part('portaobjetos', 'portaobjetos', [box(0, 185, AX, 170, 4, 62, '#cfd8e3').map((f) => ({ ...f, alpha: 0.75 }))], [-330, 150, -80], [0, 0.9, 0]),
+  part('pinzas', 'pinzas', [box(-62, 186, AX - 20, 70, 6, 14, GRAY2), box(62, 186, AX - 20, 70, 6, 14, GRAY2)], [0, 180, -200]),
+  part('platina', 'platina', [box(0, 174, AX + 10, 232, 16, 200, METAL)], [330, -10, -60], [0, 0, 0.35]),
+  part('micro', 'tornillo micrométrico', [cyl('x', 72, 232, 80, 24, 24, 22, GRAY2), cyl('x', -72, 232, 80, 24, 24, 22, GRAY2)], [0, 30, 300], [0.9, 0, 0]),
+  part('macro', 'tornillo macrométrico', [cyl('x', 44, 232, 80, 44, 44, 30, ACCENT), cyl('x', -44, 232, 80, 44, 44, 30, ACCENT)], [0, -110, 280], [1.2, 0, 0]),
+  part('lampara', 'lámpara', [cyl('y', 0, 52, AX, 34, 34, 24, METAL), cyl('y', 0, 66, AX, 25, 25, 4, '#ffd9a8')], [-200, -60, -260]),
+  part('brazo', 'brazo', [box(0, 196, 82, 46, 312, 56, PAPER), box(0, 362, 30, 50, 48, 160, PAPER)], [300, 60, 220], [0, 0.6, 0]),
+  part('base', 'base', [box(0, 20, 10, 300, 40, 240, METAL)], [0, -90, 0], [0.15, 0, 0]),
+];
+const EXPLODE_AT = Object.fromEntries(PARTS.map((p, i) => [p.name, C.explode[i]]));
+const ASSEMBLE_AT = Object.fromEntries([...PARTS].reverse().map((p, i) => [p.name, C.assemble[i]]));
+function explodeAmount(p, t) {
+  const out = E.expoOut(prog(t, EXPLODE_AT[p.name], EXPLODE_AT[p.name] + 0.45));
+  const back = E.expoIn(prog(t, ASSEMBLE_AT[p.name] - 0.32, ASSEMBLE_AT[p.name]));
+  return out * (1 - back);
+}
+function microscopeFaces(t, extra = {}) {
+  const faces = [];
+  const placed = [];
+  PARTS.forEach((p, i) => {
+    const e = explodeAmount(p, t);
+    const bob = e * Math.sin((t - 19) * 2.2 + i) * 12;
+    const off = add3(scl3(p.explode, e), [0, bob, 0]);
+    const spin = scl3(p.spin, e);
+    const lift = extra.lift || 0, sq = extra.squash || 1;
+    const tf = (v) => {
+      let q = add3(rot3(sub3(v, p.center), spin), add3(p.center, off));
+      return [q[0] * (2 - sq), q[1] * sq + lift - 265, q[2]];
+    };
+    for (const f of p.faces) faces.push({ ...f, p: f.p.map(tf), n: norm3(rot3(f.n, spin)) });
+    placed.push({ p, e, at: tf(p.center) });
+  });
+  return { faces, placed };
+}
+function microscopeCam(t, cx, cy, scale) {
+  const spinBoost = E.cubicInOut(prog(t, 20.8, 22.0)) * 0.8 + E.expoOut(prog(t, 24, 25.5)) * 1.2;
+  return { yaw: 0.55 + (t - 16) * 0.38 + spinBoost, pitch: -0.3, dist: 1500, F: 1500, cx, cy, scale };
+}
+function drawMicroscope(ctx, t, cx, cy, scale, labels) {
+  const drop = prog(t, C.micro_title, C.micro_land);
+  const lift = t < C.micro_land ? (1 - drop * drop) * 1100 : 0;
+  const land = t >= C.micro_land ? 1 - (1 - springAt(t, C.micro_land, 0.7)) * 0.18 : 1;
+  const cam = microscopeCam(t, cx, cy, scale);
+  // Floor shadow and the landing ring.
+  const fl = project([0, -265, 10], cam);
+  ctx.fillStyle = '#09070b';
+  ctx.beginPath(); ctx.ellipse(fl[0], fl[1], 230 * fl[2] * (1 - lift / 2200), 70 * fl[2] * (1 - lift / 2200), 0, 0, TAU); ctx.fill();
+  for (const ring of [C.micro_land, C.assembled]) {
+    const dt = t - ring;
+    if (dt < 0 || dt > 0.6) continue;
+    ctx.strokeStyle = ACCENT; ctx.lineWidth = 4 * (1 - dt / 0.6);
+    ctx.beginPath(); ctx.ellipse(fl[0], fl[1], (230 + E.expoOut(dt / 0.6) * 420) * fl[2], (70 + E.expoOut(dt / 0.6) * 130) * fl[2], 0, 0, TAU); ctx.stroke();
+  }
+  const { faces, placed } = microscopeFaces(t, { lift, squash: land });
+  renderFaces(ctx, faces, cam);
+  if (!labels) return;
+  // Callouts for exploded parts.
+  const mid = project([0, 0, 0], cam);
+  for (const q of placed) {
+    if (q.e < 0.55) continue;
+    const pt = project(q.at, cam);
+    let dx = pt[0] - mid[0], dy = pt[1] - mid[1];
+    const m = Math.hypot(dx, dy) || 1; dx /= m; dy /= m;
+    const lx = pt[0] + dx * 130, ly = pt[1] + dy * 80;
+    const show = typed(q.p.label, prog(q.e, 0.55, 0.95));
+    ctx.strokeStyle = GRAY2; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(pt[0], pt[1]); ctx.lineTo(lx, ly); ctx.lineTo(lx + (dx < 0 ? -24 : 24), ly); ctx.stroke();
+    ctx.fillStyle = ACCENT; ctx.beginPath(); ctx.arc(pt[0], pt[1], 6, 0, TAU); ctx.fill();
+    font(ctx, 38, true); ctx.fillStyle = PAPER;
+    const w = ctx.measureText(show).width;
+    ctx.fillText(show, clamp(dx < 0 ? lx - 32 - w : lx + 32, 40, W - 40 - w), clamp(ly + 11, 60, H - 30));
+  }
+}
+
+// ---- scene A: Rojita (0-2.5) ------------------------------------------------------------------------------
+function sceneA(ctx, t) {
+  const size = 400;
+  const l = layout(ctx, 'Rojita', size);
+  const x0 = (W - l.width) / 2 - 120, base = 640;
+  const settle = springAt(t, C.name_swoosh, 0.7);
+  font(ctx, size);
+  l.letters.forEach((le, i) => {
+    const c = C.name_letters[i];
+    if (t < c) return;
+    const p = E.backOut(clamp((t - c) / 0.32), 2.6);
+    const drop = (1 - E.bounce(clamp((t - c) / 0.5))) * -260;
+    ctx.save();
+    ctx.translate(x0 + le.x + le.w / 2, base + drop);
+    ctx.rotate((i % 2 ? 1 : -1) * 0.5 * (1 - clamp((t - c) / 0.3)));
+    const sq = t > C.name_swoosh ? 1 - (1 - settle) * 0.2 : 1;
+    ctx.scale(p * (2 - sq), p * sq);
+    ctx.fillStyle = ACCENT;
+    ctx.fillText(le.ch, -le.w / 2, 0);
+    ctx.restore();
+    const dt = t - c; // pop ring
+    if (dt < 0.35) {
+      ctx.strokeStyle = PAPER; ctx.lineWidth = 3 * (1 - dt / 0.35);
+      ctx.beginPath(); ctx.arc(x0 + le.x + le.w / 2, base - l.asc - 40, 10 + E.expoOut(dt / 0.35) * 60, 0, TAU); ctx.stroke();
+    }
+  });
+  const sw = E.expoOut(prog(t, C.name_swoosh, C.name_swoosh + 0.45));
+  if (sw > 0) {
+    ctx.strokeStyle = PAPER; ctx.lineWidth = 16; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i = 0; i <= 40 * sw; i++) {
+      const u = i / 40;
+      const x = x0 + u * l.width, y = base + 70 + Math.sin(u * Math.PI * 2.2) * 16;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke(); ctx.lineCap = 'butt';
+  }
+}
+
+// ---- scene B: Esto que estás viendo / lo creé con Claude. ---------------------------------------------------
+function sceneB(ctx, t) {
+  const size = 150;
+  let x = 160;
+  ['Esto', 'que', 'estás', 'viendo'].forEach((w, i) => { x += slamWord(ctx, w, x, 400, size, C.line1[i], t, i, PAPER) + 40; });
+  x = 160;
+  ['lo', 'creé', 'con'].forEach((w, i) => { x += slamWord(ctx, w, x, 620, size, C.line2[i], t, i + 1, PAPER) + 40; });
+  const c = C.claude;
+  if (t >= c) {
+    const l = layout(ctx, 'Claude.', 300);
+    const p = E.expoOut(prog(t, c, c + 0.2));
+    const punch = lerp(1.6, 1, p) * (1 + (1 - springAt(t, c + 0.15, 0.5)) * 0.06);
+    ctx.save();
+    ctx.translate(160 + l.width / 2, 900 - l.asc / 2);
+    ctx.scale(punch, punch);
+    font(ctx, 300); ctx.fillStyle = ACCENT;
+    ctx.fillText('Claude.', -l.width / 2, l.asc / 2);
+    ctx.restore();
+  }
+  font(ctx, 34, true); ctx.fillStyle = GRAY2;
+  if (t > c + 0.3) ctx.fillText(typed('cada cuadro y cada sonido, escritos en código', prog(t, c + 0.3, c + 1.0)), 166, 990);
+}
+
+// ---- scene C: Mira las letras / y lo dinámicas / que se ven. -----------------------------------------------------
+function trick(ctx, i, k) { // k: 0..1 progress of the trick
+  switch (i % 6) {
+    case 0: ctx.scale(Math.cos(k * TAU), 1); break;                       // flip
+    case 1: ctx.scale(1, 1 + Math.sin(k * Math.PI) * 0.6); break;          // stretch
+    case 2: ctx.rotate(k * TAU); break;                                    // spin
+    case 3: ctx.translate(0, -Math.sin(k * Math.PI) * 140); break;         // jump
+    case 4: { const s = 1 + Math.sin(k * Math.PI) * 0.5; ctx.scale(s, s); break; } // grow
+    default: ctx.transform(1, 0, -Math.sin(k * Math.PI) * 0.6, 1, 0, 0);   // lean
+  }
+}
+function sceneC(ctx, t) {
+  const size = 170;
+  let x = 160;
+  ['Mira', 'las'].forEach((w, i) => { x += popWord(ctx, w, x, 300, size, C.mira[i], t, PAPER, 0.3) + 44; });
+  // "letras": every letter does its own trick on its own tick.
+  if (t >= C.mira[2]) {
+    const l = layout(ctx, 'letras', size);
+    const p = E.backOut(clamp((t - C.mira[2]) / 0.35), 2.4);
+    font(ctx, size);
+    l.letters.forEach((le, i) => {
+      const k = prog(t, C.letras[i], C.letras[i] + 0.45);
+      ctx.save();
+      ctx.translate(x + le.x + le.w / 2, 300 - l.asc / 2);
+      ctx.scale(p, p);
+      if (k > 0 && k < 1) trick(ctx, i, E.cubicInOut(k));
+      ctx.fillStyle = k > 0 && k < 1 ? ACCENT : PAPER;
+      ctx.fillText(le.ch, -le.w / 2, l.asc / 2);
+      ctx.restore();
+    });
+  }
+  x = 160;
+  ['y', 'lo'].forEach((w, i) => { x += slamWord(ctx, w, x, 540, size, C.dinamicas_line[i], t, i, PAPER) + 44; });
+  // "dinámicas": letters drop in one per tick, then ride a wave.
+  const l = layout(ctx, 'dinámicas', size);
+  font(ctx, size);
+  l.letters.forEach((le, i) => {
+    const c = C.dinamicas[i];
+    if (t < c) return;
+    const drop = (1 - E.bounce(clamp((t - c) / 0.45))) * -320;
+    const wave = Math.sin((t - 10.6) * 7 - i * 0.7) * 22 * prog(t, 10.6, 10.9);
+    ctx.save();
+    ctx.translate(x + le.x, 540 + drop + wave);
+    ctx.fillStyle = i % 3 === 1 ? ACCENT : PAPER;
+    ctx.fillText(le.ch, 0, 0);
+    ctx.restore();
+  });
+  x = 160;
+  ['que', 'se', 'ven.'].forEach((w, i) => { x += popWord(ctx, w, x, 780, size, C.seven[i], t, i === 2 ? ACCENT : PAPER, -0.3) + 44; });
+}
+
+// ---- scene D: Puedo generar / gráficos en 3D. --------------------------------------------------------------------
+function wireShape(kind) {
+  if (kind === 'cube') {
+    const v = [-1, 1].flatMap((x) => [-1, 1].flatMap((y) => [-1, 1].map((z) => [x, y, z])));
+    const e = [];
+    v.forEach((a, i) => v.forEach((b, j) => { if (j > i && Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]) === 2) e.push([a, b]); }));
+    return e;
+  }
+  if (kind === 'octa') {
+    const v = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].map((p) => p.map((c) => c * 1.3));
+    const e = [];
+    v.forEach((a, i) => v.forEach((b, j) => { if (j > i && dot3(a, b) === 0) e.push([a, b]); }));
+    return e;
+  }
+  const e = []; // torus
+  const R = 1, r = 0.42, nu = 24, nv = 10;
+  const P = (u, v) => [(R + r * Math.cos(v)) * Math.cos(u), r * Math.sin(v), (R + r * Math.cos(v)) * Math.sin(u)];
+  for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) {
+    const u = (i / nu) * TAU, v = (j / nv) * TAU, u2 = ((i + 1) / nu) * TAU, v2 = ((j + 1) / nv) * TAU;
+    e.push([P(u, v), P(u2, v)], [P(u, v), P(u, v2)]);
+  }
+  return e;
+}
+const SHAPES = ['cube', 'torus', 'octa'].map(wireShape);
+function drawGrid(ctx, t, horizon = 600) {
+  ctx.strokeStyle = GRAY; ctx.lineWidth = 1.5;
+  for (let i = -14; i <= 14; i++) { // lines toward the vanishing point
+    ctx.beginPath(); ctx.moveTo(W / 2 + i * 26, horizon); ctx.lineTo(W / 2 + i * 260, H + 40); ctx.stroke();
+  }
+  const scroll = (t * 1.6) % 1;
+  for (let k = 0; k < 14; k++) {
+    const z = k + 1 - scroll;
+    const y = horizon + 420 / z;
+    if (y > H + 10) continue;
+    ctx.globalAlpha = clamp(1 - z / 14);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function extruded(ctx, text, x, y, size, yaw, depth, t) {
+  const l = layout(ctx, text, size);
+  font(ctx, size);
+  const sx = Math.cos(yaw), ox = Math.sin(yaw) * 1.0;
+  for (let k = depth; k >= 0; k--) {
+    ctx.save();
+    ctx.translate(x + l.width / 2 + ox * k, y + k * 0.55);
+    ctx.scale(sx, 1);
+    ctx.fillStyle = k === 0 ? ACCENT : mix('#3a0d16', '#8a1a2b', 1 - k / depth);
+    ctx.fillText(text, -l.width / 2, 0);
+    ctx.restore();
+  }
+  void t;
+}
+function sceneD(ctx, t) {
+  drawGrid(ctx, t);
+  let x = 160;
+  ['Puedo', 'generar'].forEach((w, i) => { x += slamWord(ctx, w, x, 230, 120, C.puedo[i], t, i * 2 + 2, PAPER) + 36; });
+  x = 160;
+  ['gráficos', 'en'].forEach((w, i) => { x += popWord(ctx, w, x, 400, 120, C.graficos[i], t, PAPER) + 36; });
+  if (t >= C.three_d) {
+    const p = E.backOut(clamp((t - C.three_d) / 0.4), 2);
+    const yaw = Math.sin((t - C.three_d) * 2.2) * 0.55;
+    ctx.save();
+    ctx.translate(x + 220, 700); ctx.scale(p, p); ctx.translate(-(x + 220), -700);
+    extruded(ctx, '3D', x, 760, 420, yaw, 34, t);
+    ctx.restore();
+  }
+  // Wireframe solids orbit in on their cues.
+  const spots = [[1500, 300, 120], [1660, 720, 140], [1240, 900, 90]];
+  SHAPES.forEach((edges, k) => {
+    const c = C.shapes[k];
+    if (t < c) return;
+    const s = E.backOut(clamp((t - c) / 0.4), 2) * spots[k][2];
+    const r = [(t - c) * 1.3 + k, (t - c) * 1.7, k * 0.4];
+    ctx.strokeStyle = k === 1 ? ACCENT : PAPER; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (const [a, b] of edges) {
+      const pa = rot3(a, r), pb = rot3(b, r);
+      const fa = 600 / (600 + pa[2] * s), fb = 600 / (600 + pb[2] * s);
+      ctx.moveTo(spots[k][0] + pa[0] * s * fa, spots[k][1] - pa[1] * s * fa);
+      ctx.lineTo(spots[k][0] + pb[0] * s * fb, spots[k][1] - pb[1] * s * fb);
+    }
+    ctx.stroke();
+  });
+}
+
+// ---- scene E: the microscope (15-24) --------------------------------------------------------------------------
+function sceneE(ctx, t) {
+  drawGrid(ctx, t * 0.3, 640);
+  const words = ['Es', 'más,', 'mira', 'este'];
+  let x = 140;
+  const shrink = E.expoInOut(prog(t, 17.0, 17.5));
+  const size = lerp(110, 64, shrink), y1 = lerp(220, 130, shrink);
+  words.forEach((w, i) => { x += popWord(ctx, w, x, y1, size, C.esmas[i], t, PAPER) + size * 0.3; });
+  const tsize = lerp(150, 64, shrink);
+  const titleY = lerp(400, 210, shrink);
+  const title = () => { if (t >= C.micro_title) {
+    const p = E.expoOut(prog(t, C.micro_title, C.micro_title + 0.35));
+    ctx.save(); ctx.beginPath(); ctx.rect(0, titleY - tsize * 1.1, W, tsize * 1.4); ctx.clip();
+    font(ctx, tsize); ctx.fillStyle = ACCENT;
+    ctx.fillText('microscopio en 3D,', 140, titleY + (1 - p) * tsize * 1.2);
+    ctx.restore();
+  } };
+  drawMicroscope(ctx, t, 1240, 590, 1.32, true);
+  title();
+  // Captions for the teardown and rebuild.
+  const cap = (text, at, until, y) => {
+    if (t < at || t > until) return;
+    font(ctx, 58);
+    const shown = typed(text, prog(t, at, at + 0.55));
+    const w = ctx.measureText(shown).width;
+    ctx.fillStyle = INK; ctx.fillRect(116, y - 62, w + 48, 84);
+    ctx.fillStyle = PAPER; ctx.fillText(shown, 140, y);
+  };
+  cap('que ahora se desarma en partes…', C.desarma_text, 21.4, 900);
+  cap('…y luego se vuelve a construir.', C.construir_text, 24.0, 900);
+  if (t > C.assembled - 0.01) { // a glint crosses the rebuilt microscope
+    const g = prog(t, C.assembled, C.assembled + 0.5);
+    ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.25 * Math.sin(g * Math.PI);
+    ctx.fillStyle = PAPER; ctx.translate(lerp(900, 1600, g), 0); ctx.rotate(0.35); ctx.fillRect(-30, -200, 60, 1600);
+    ctx.restore();
+  }
+}
+
+// ---- scene F: Se ve muy cool, ¿verdad? (24-27) ------------------------------------------------------------------
+function sceneF(ctx, t) {
+  drawGrid(ctx, t * 0.3, 640);
+  drawMicroscope(ctx, t, 1400, 640, 0.85, false);
+  let x = 140;
+  ['Se', 've', 'muy'].forEach((w, i) => { x += popWord(ctx, w, x, 360, 150, C.cool[i], t, PAPER) + 44; });
+  if (t >= C.cool[3]) {
+    const l = layout(ctx, 'cool,', 150);
+    font(ctx, 150);
+    l.letters.forEach((le, i) => {
+      const p = E.backOut(clamp((t - C.cool[3] - i * 0.04) / 0.3), 2.5);
+      if (p <= 0) return;
+      ctx.save();
+      ctx.translate(140 + le.x + le.w / 2, 560 + Math.sin((t - 24.8) * 8 + i) * 10);
+      ctx.rotate(Math.sin((t - 24.8) * 5 + i * 1.3) * 0.12);
+      ctx.scale(p, p);
+      ctx.fillStyle = ACCENT; ctx.fillText(le.ch, -le.w / 2, 0);
+      ctx.restore();
+    });
+  }
+  if (t >= C.verdad) {
+    const p = E.expoOut(prog(t, C.verdad, C.verdad + 0.25));
+    const s = lerp(1.5, 1, p) * (1 + (1 - springAt(t, C.verdad + 0.1, 0.5)) * 0.05);
+    const l = layout(ctx, '¿verdad?', 190);
+    ctx.save();
+    ctx.translate(140 + l.width / 2, 800 - l.asc / 2); ctx.scale(s, s);
+    font(ctx, 190); ctx.fillStyle = PAPER; ctx.fillText('¿verdad?', -l.width / 2, l.asc / 2);
+    ctx.restore();
+  }
+}
+
+// ---- scene G: ¿Qué tienes para decir? (27-30) -----------------------------------------------------------------------
+function sceneG(ctx, t) {
+  let x = 140;
+  ['¿Qué', 'tienes'].forEach((w, i) => { x += popWord(ctx, w, x, 420, 170, C.que[i], t, PAPER) + 50; });
+  x = 140;
+  let last = 0;
+  ['para', 'decir?'].forEach((w, i) => { const wd = popWord(ctx, w, x, 640, 170, C.que[i + 2], t, PAPER); if (wd) last = x + wd; x += wd + 50; });
+  if (t > C.que[3] + 0.3 && Math.floor(t * 3) % 2 === 0) { ctx.fillStyle = ACCENT; ctx.fillRect(last + 20, 640 - 130, 18, 150); }
+  // The big question mark drops in and bounces on the boing.
+  if (t >= C.question - 0.35) {
+    const fall = prog(t, C.question - 0.35, C.question);
+    const y = t < C.question ? -400 + 1100 * fall * fall : 700;
+    const sq = t >= C.question ? 1 - (1 - springAt(t, C.question, 0.8)) * 0.35 : 1 + fall * 0.2;
+    ctx.save();
+    ctx.translate(1520, y);
+    ctx.rotate(Math.sin((t - C.question) * 4) * 0.12 * prog(t, C.question, C.question + 0.3));
+    ctx.scale(2 - sq, sq);
+    font(ctx, 700); ctx.fillStyle = ACCENT;
+    const l = layout(ctx, '?', 700);
+    ctx.fillText('?', -l.width / 2, 0);
+    ctx.restore();
+  }
+  if (t > C.end) {
+    font(ctx, 36, true); ctx.fillStyle = GRAY2;
+    ctx.fillText(typed('hecho con Claude · 30 s · todo en código', prog(t, C.end, C.end + 0.5)), 146, 860);
+  }
+}
+
+// ---- timeline ---------------------------------------------------------------------------------------------------------
+const SCENES = [[0, sceneA], [2.5, sceneB], [7, sceneC], [12, sceneD], [15, sceneE], [24, sceneF], [27, sceneG]];
+const lastCut = (t) => C.cuts.reduce((m, c) => (c <= t + 1e-6 ? c : m), -Infinity);
+const IMPACTS = [[0, 10], [C.claude, 18], [C.three_d, 14], [C.micro_land, 16], [C.assembled, 12], [C.verdad, 8], [C.question, 10]];
+function shake(t) {
+  let x = 0, y = 0;
+  IMPACTS.forEach(([at, a], i) => {
+    const dt = t - at;
+    if (dt < 0) return;
+    const env = a * Math.exp(-dt * 9);
+    x += env * noise1(dt * 35 + i * 40); y += env * noise1(dt * 35 + i * 40 + 300);
+  });
+  return [x, y];
+}
+const GLITCH = document.createElement('canvas'); GLITCH.width = W; GLITCH.height = H;
+function draw(ctx, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+  const [sx, sy] = shake(t);
+  let scene = SCENES[0][1];
+  for (const [start, fn] of SCENES) if (t >= start) scene = fn;
+  const glitching = t >= C.glitch && t < 12;
+  if (!glitching) { ctx.translate(sx, sy); scene(ctx, t); return; }
+  // Glitch: render the frame, then shear it into slices with an accent ghost.
+  const g = GLITCH.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = INK; g.fillRect(0, 0, W, H);
+  scene(g, t);
+  const r = mulberry32(Math.floor(t * 30) + 7);
+  const k = prog(t, C.glitch, 12);
+  for (let y = 0; y < H;) {
+    const h = 20 + Math.floor(r() * 90);
+    const off = (r() - 0.5) * 300 * (0.4 + k);
+    if (r() < 0.3) { ctx.globalAlpha = 0.8; ctx.fillStyle = ACCENT; ctx.fillRect(0, y, W, 3); ctx.globalAlpha = 1; }
+    ctx.drawImage(GLITCH, 0, y, W, h, off, y, W, h);
+    y += h;
+  }
+  ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.35;
+  ctx.drawImage(GLITCH, 14 + k * 30, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+
+const GRAIN = (() => {
+  const r = mulberry32(99);
+  return [0, 1, 2].map(() => {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d'), img = g.createImageData(256, 256);
+    for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+    g.putImageData(img, 0, 0);
+    return c;
+  });
+})();
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const acc = document.createElement('canvas'); acc.width = W; acc.height = H;
+const actx = acc.getContext('2d');
+const SHUTTER = 1 / 60;
+const SAMPLES = window.RENDER ? 5 : 1;
+window.seek = function (t) {
+  if (SAMPLES === 1) draw(ctx, t);
+  else {
+    for (let i = 0; i < SAMPLES; i++) {
+      draw(actx, Math.max(lastCut(t), t - SHUTTER * (1 - i / (SAMPLES - 1))));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1 / (i + 1);
+      ctx.drawImage(acc, 0, 0);
+    }
+  }
+  const frame = Math.round(t * 30);
+  const r = mulberry32(frame + 1);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 0.06; ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = ctx.createPattern(GRAIN[frame % 3], 'repeat');
+  ctx.translate(-r() * 256, -r() * 256);
+  ctx.fillRect(0, 0, W + 256, H + 256);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+};
+window.READY = Promise.all([document.fonts.load('800 100px Display'), document.fonts.load('500 30px UI')]);
+if (!window.RENDER) {
+  const audio = new Audio('audio.wav');
+  document.body.addEventListener('click', () => { audio.currentTime = 0; audio.play(); });
+  window.READY.then(() => {
+    const loop = () => { seek(audio.paused ? (performance.now() / 1000) % window.DURATION : audio.currentTime); requestAnimationFrame(loop); };
+    loop();
+  });
+}
+</script>
+</body>
+</html>
