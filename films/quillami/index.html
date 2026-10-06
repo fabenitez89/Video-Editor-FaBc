@@ -1,0 +1,593 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Quillami</title>
+<style>
+  @font-face { font-family: 'Unb'; src: url(fonts/unbounded-800.woff2) format('woff2'); font-weight: 800; }
+  @font-face { font-family: 'Unb'; src: url(fonts/unbounded-400.woff2) format('woff2'); font-weight: 400; }
+  @font-face { font-family: 'UI'; src: url(fonts/jetbrains-mono-500.woff2) format('woff2'); font-weight: 500; }
+  html, body { margin: 0; background: #000002; }
+  canvas { display: block; width: 100vw; height: auto; }
+</style>
+<script src="cues.js"></script>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+// Quillami Car Wash, 25 s, 9:16. Grammar from docs/style_guide.md, shots from docs/shotlist.md.
+// One global field of light streaks carries every camera move; no hard cuts, one whiteout.
+const W = 1080, H = 1920;
+window.WIDTH = W; window.HEIGHT = H; window.DURATION = 25;
+const C = window.CUES;
+
+const VOID = '#000002', NAVY = '#01041d', HOLD_TOP = '#00182b', HOLD_BOT = '#000e19';
+const ICE = '#c0e0ed', ICE2 = '#96c7dc', WHITE = '#f0fafd', TURQ = '#00d1d8', TURQ_GLOW = '#44e1e5', STREAK = '#17698e';
+
+// ---- math -------------------------------------------------------------------------------------------
+const TAU = Math.PI * 2;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, x) => a + (b - a) * x;
+const prog = (x, a, b) => clamp((x - a) / (b - a));
+const frac = (x) => x - Math.floor(x);
+const E = {
+  expoOut: (x) => (x >= 1 ? 1 : 1 - Math.pow(2, -10 * x)),
+  expoIn: (x) => (x <= 0 ? 0 : Math.pow(2, 10 * x - 10)),
+  cubicInOut: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+  quadIn: (x) => x * x,
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rgba = (hex, a) => `rgba(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(',')},${clamp(a)})`;
+
+// ---- the streak field: one camera, re-oriented over time --------------------------------------------
+// orient: 0 radial (forward motion), 1 horizontal (lateral motion). arc bends horizontal streaks over the mark.
+const WHIPS = [C.whip1, C.whip2, C.whip3].map(([a, z]) => [a, z]);
+function speedAt(t) {
+  let s = 1;
+  for (const [a, z] of WHIPS) s += 3.2 * Math.sin(Math.PI * prog(t, a, z));
+  s += 2.2 * Math.sin(Math.PI * prog(t, C.smear[0], C.smear[1]));
+  if (t > 18) s += 5 * E.quadIn(prog(t, 18, 20));
+  if (t >= 20) s = lerp(4, 0, E.expoOut(prog(t, 20, 22.2)));
+  return s;
+}
+const TRAVEL_DT = 1 / 120;
+function travel(t) { // integral of speed: the camera's position, a pure function of time
+  let x = 0;
+  for (let u = 0; u < t; u += TRAVEL_DT) x += speedAt(u) * Math.min(TRAVEL_DT, t - u);
+  return x;
+}
+function field(t) {
+  const toH = (a, z) => E.cubicInOut(prog(t, a, z));
+  let orient = toH(3.33, 4.0);                                   // shot 1 orbit
+  orient *= 1 - toH(C.whip2[0] + 0.15, C.whip2[1] + 0.1);         // shot 4 dolly down: radial again
+  orient = Math.max(orient, toH(C.whip3[0] + 0.1, C.whip3[1]));   // shot 5 lateral
+  if (t >= C.smear[0]) orient = 1 - toH(C.smear[0], C.smear[1] + 0.2); // build: forward
+  if (t >= 20) orient = 1;
+  let vp = [540, 634];
+  if (t > C.whip2[0] && t < C.whip3[1]) vp = [540, lerp(634, 1180, toH(C.whip2[0], C.whip2[1]))];
+  let density = t < 0.33 ? 0 : E.expoOut(prog(t, 0.33, 0.9));
+  if (t > 18) density *= 1 + 0.5 * prog(t, 18, 20);
+  if (t >= 20) density = 1.2 * (1 - prog(t, 21.4, 22.6));
+  const arc = t >= 20 ? 1 : 0;
+  // Lateral shots with a subject: streaks stay in the upper band, clear of the panel and the window.
+  const lateral = Math.max(prog(t, 3.6, 4.2) * (1 - prog(t, C.whip2[0], C.whip2[1])), prog(t, C.whip3[0], C.whip3[1]) * (1 - prog(t, C.smear[0], C.smear[1])));
+  const band = lerp(0.62, 0.31, lateral);
+  return { orient, vp, density, arc, band, speed: speedAt(t), travel: travel(t) };
+}
+const STREAKS = Array.from({ length: 230 }, (_, i) => {
+  const r = mulberry32(i * 7919 + 13);
+  return { a: r() * TAU, ph: r(), sp: 0.55 + r() * 0.9, w: r(), y: r(), len: 0.35 + r() * 0.65 };
+});
+function streakPoints(s, f, flipY = false) {
+  const pts = [];
+  // Radial: depth z cycles toward the camera; radius grows with 1/(1-z).
+  const z = frac(s.ph + f.travel * 0.22 * s.sp);
+  const stretch = 0.05 + 0.04 * f.speed * s.len;
+  const R = (zz) => 18 / Math.pow(1.04 - zz, 1.45);
+  // Horizontal: x scrolls right-to-left.
+  const span = W + 1600;
+  const hx = W + 800 - frac(s.ph + f.travel * 0.55 * s.sp) * span;
+  const hlen = (120 + 520 * s.len) * (0.5 + 0.5 * f.speed);
+  const band = f.band ?? 0.62;
+  const hy = f.arc ? H * (0.06 + 0.28 * Math.pow(s.y, 1.2)) : H * (0.04 + band * Math.pow(s.y, 1.25));
+  for (let k = 0; k < 4; k++) {
+    const u = k / 3;
+    const rz = clamp(z - stretch * (1 - u), 0, 0.999);
+    const rx = f.vp[0] + Math.cos(s.a) * R(rz), ry = f.vp[1] + Math.sin(s.a) * R(rz);
+    const x = hx + hlen * (1 - u);
+    let y = hy;
+    if (f.arc) y += 170 * Math.pow((x - 540) / 600, 2);
+    pts.push([lerp(rx, x, f.orient), lerp(ry, y, f.orient)]);
+  }
+  const bright = lerp(Math.pow(z, 1.3), 1, f.orient);
+  if (flipY) pts.forEach((p) => { p[1] = 2 * flipY - p[1]; });
+  return { pts, bright };
+}
+function drawStreaks(ctx, t, opts = {}) {
+  const f = opts.field || field(t);
+  if (f.density <= 0.001) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (const s of STREAKS) {
+    const { pts, bright } = streakPoints(s, f, opts.flipY);
+    const a = f.density * (0.25 + 0.75 * s.w) * bright * (opts.gain ?? 1);
+    if (a < 0.01) continue;
+    const path = () => { ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); };
+    path(); ctx.strokeStyle = rgba(STREAK, a * 0.45); ctx.lineWidth = 6; ctx.stroke();
+    path(); ctx.strokeStyle = rgba(s.w > 0.85 ? WHITE : ICE, a); ctx.lineWidth = 1.2 + s.w * 1.2; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ---- light-built type ----------------------------------------------------------------------------------
+function setFont(ctx, size, kind) {
+  ctx.font = kind === 'ui' ? `500 ${size}px UI` : kind === 'light' ? `400 ${size}px Unb` : `800 ${size}px Unb`;
+}
+const glyphCache = new Map();
+// A word pre-rendered with its glow; letters are then drawn from it slice by slice.
+function glyphs(text, size, kind, color, glow, track) {
+  const key = [text, size, kind, color, glow, track].join('|');
+  if (glyphCache.has(key)) return glyphCache.get(key);
+  const m = document.createElement('canvas').getContext('2d');
+  setFont(m, size, kind);
+  const letters = [];
+  let x = 0;
+  for (const ch of text) { const w = m.measureText(ch).width; letters.push({ ch, x, w }); x += w + track * size; }
+  const width = x - track * size, pad = Math.ceil(size * 0.5);
+  const asc = size * 0.78, desc = size * 0.22;
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(width + pad * 2); c.height = Math.ceil(asc + desc + pad * 2);
+  const g = c.getContext('2d');
+  setFont(g, size, kind);
+  g.textBaseline = 'alphabetic';
+  if (glow) { g.shadowColor = glow; g.shadowBlur = size * 0.16; }
+  g.fillStyle = color;
+  for (const l of letters) g.fillText(l.ch, pad + l.x, pad + asc);
+  if (glow) { g.shadowBlur = 0; for (const l of letters) g.fillText(l.ch, pad + l.x, pad + asc); }
+  const out = { c, letters, width, pad, asc, desc };
+  glyphCache.set(key, out);
+  return out;
+}
+function fit(text, maxW, size, kind, track) {
+  const m = document.createElement('canvas').getContext('2d');
+  setFont(m, 100, kind);
+  let w = 0; for (const ch of text) w += m.measureText(ch).width + track * 100;
+  w -= track * 100;
+  return Math.min(size, (100 * maxW) / w);
+}
+// Built from light (enter), absolutely still (hold), smeared into streaks (exit).
+// tIn: the beat the word is fully formed on. tOut: when it starts to smear (null = never).
+function lightText(ctx, t, text, cx, base, size, o = {}) {
+  const kind = o.kind || 'bold', track = o.track ?? 0.04;
+  const G = glyphs(text, size, kind, o.color || WHITE, o.glow === false ? null : (o.glow || rgba(TURQ_GLOW, 0.85)), track);
+  const build = o.build ?? 0.45;
+  const p = prog(t, o.tIn - build, o.tIn);
+  if (p <= 0) return G;
+  const q = o.tOut != null ? prog(t, o.tOut, o.tOut + 0.42) : 0;
+  if (q >= 1) return G;
+  const x0 = cx - G.width / 2 - G.pad, y0 = base - G.asc - G.pad;
+  const slices = o.slices || 7, sh = G.c.height / slices;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  G.letters.forEach((l, li) => {
+    for (let k = 0; k < slices; k++) {
+      const r = mulberry32((li + 1) * 131 + k * 17 + text.length);
+      const arrive = 0.3 + r() * 0.7, side = r() < 0.5 ? -1 : 1, dist = 260 + r() * 640;
+      const sx = G.pad + l.x - 4, sw = l.w + 8, sy = k * sh;
+      const f = clamp(p / arrive);
+      if (q > 0) { // exit: each slice races off and stretches into a streak
+        const run = E.expoIn(q) * (900 + r() * 900) * (o.exitDir ?? -1);
+        ctx.globalAlpha = 1 - q;
+        ctx.drawImage(G.c, sx, sy, sw, sh, x0 + sx + run, y0 + sy, sw * (1 + q * 5), sh * (1 - q * 0.6));
+        continue;
+      }
+      if (f < 1) { // fragment converging onto its slot
+        const off = side * dist * Math.pow(1 - f, 2);
+        const len = lerp(160, sw, f);
+        ctx.globalAlpha = 0.25 + 0.75 * f;
+        ctx.fillStyle = rgba(ICE, 1);
+        ctx.fillRect(x0 + sx + sw / 2 - len / 2 + off, y0 + sy + sh * 0.45, len, Math.max(1.5, sh * 0.12));
+      } else {
+        ctx.globalAlpha = 1;
+        ctx.drawImage(G.c, sx, sy, sw, sh, x0 + sx, y0 + sy, sw, sh);
+      }
+    }
+  });
+  ctx.restore();
+  return G;
+}
+
+// ---- reflections ----------------------------------------------------------------------------------------
+const LAYER = document.createElement('canvas'); LAYER.width = W; LAYER.height = H;
+function withReflection(ctx, horizon, drawSubject, gain = 0.4) {
+  const g = LAYER.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, W, H);
+  drawSubject(g);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, horizon, W, H - horizon); ctx.clip();
+  ctx.translate(0, 2 * horizon); ctx.scale(1, -1);
+  ctx.globalAlpha = gain; ctx.filter = 'blur(7px)';
+  ctx.drawImage(LAYER, 0, 0);
+  ctx.restore();
+  ctx.drawImage(LAYER, 0, 0);
+  // Contact glow along the horizon.
+  const gl = ctx.createLinearGradient(0, horizon - 6, 0, horizon + 26);
+  gl.addColorStop(0, rgba(ICE, 0)); gl.addColorStop(0.3, rgba(ICE, 0.18)); gl.addColorStop(1, rgba(ICE, 0));
+  ctx.fillStyle = gl; ctx.fillRect(0, horizon - 6, W, 32);
+}
+
+// ---- backgrounds ----------------------------------------------------------------------------------------
+function background(ctx, t) {
+  const hold = prog(t, 20, 22);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, hold > 0 ? lerpHex(VOID, HOLD_TOP, hold) : VOID);
+  g.addColorStop(0.6, hold > 0 ? lerpHex(NAVY, '#001426', hold) : '#000008');
+  g.addColorStop(1, hold > 0 ? lerpHex(NAVY, HOLD_BOT, hold) : NAVY);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (hold > 0) { // soft lift behind the wordmark
+    const r = ctx.createRadialGradient(540, 700, 0, 540, 700, 700);
+    r.addColorStop(0, rgba('#0c3b55', 0.55 * hold)); r.addColorStop(1, rgba('#0c3b55', 0));
+    ctx.fillStyle = r; ctx.fillRect(0, 0, W, H);
+  }
+}
+function lerpHex(a, b, x) {
+  const pa = [1, 3, 5].map((i) => parseInt(a.slice(i, i + 2), 16)), pb = [1, 3, 5].map((i) => parseInt(b.slice(i, i + 2), 16));
+  return `rgb(${pa.map((v, i) => Math.round(lerp(v, pb[i], clamp(x)))).join(',')})`;
+}
+
+// ---- shot 1: tunnel, droplet, hook (0-4) ----------------------------------------------------------------
+function droplet(ctx, x, y, r, a = 1) {
+  ctx.save();
+  ctx.globalAlpha = a;
+  const g = ctx.createRadialGradient(x - r * 0.25, y - r * 0.3, r * 0.1, x, y, r);
+  g.addColorStop(0, rgba('#0a2a44', 0.35)); g.addColorStop(0.75, rgba('#0c3b55', 0.25)); g.addColorStop(0.96, rgba(ICE2, 0.9)); g.addColorStop(1, rgba(ICE, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = rgba(WHITE, 0.9); ctx.lineWidth = Math.max(1.5, r * 0.05); ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(x, y, r * 0.78, Math.PI * 1.08, Math.PI * 1.42); ctx.stroke();
+  ctx.fillStyle = rgba(TURQ_GLOW, 0.8);
+  ctx.beginPath(); ctx.ellipse(x + r * 0.32, y + r * 0.42, r * 0.22, r * 0.1, -0.5, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function shot1(ctx, t) {
+  // The first frame: one cyan streak flicks across the void.
+  if (t < 0.4) {
+    const p = prog(t, 0, 0.35);
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = rgba(ICE, 1 - p); ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(lerp(820, -200, p), lerp(260, 1500, p)); ctx.lineTo(lerp(900, 80, p), lerp(120, 1100, p)); ctx.stroke();
+    ctx.restore();
+  }
+  const d = Math.pow(prog(t, C.drop - 0.2, 3.6), 1.5);
+  if (t > C.drop - 0.2) {
+    const orbit = E.cubicInOut(prog(t, 3.33, 4.0));
+    const x = lerp(540, 540, d) - orbit * 900, y = lerp(634, 1250, d);
+    const r = 14 / (1 - 0.93 * d);
+    droplet(ctx, x, y, Math.min(r, 210), 1 - orbit * 0.6);
+  }
+  const words = [['TU CARRO', WHITE, 560], ['MERECE', WHITE, 720], ['BRILLAR.', TURQ, 880]];
+  words.forEach(([w, col, y], i) => {
+    const size = fit(w, 920, 150, 'bold', 0.04);
+    lightText(ctx, t, w, 540, y, size, { tIn: C.hook[i], tOut: 3.33 + i * 0.06, color: col });
+  });
+}
+
+// ---- shot 2: LAVADO (4-8) ---------------------------------------------------------------------------------
+const H2 = 1114;
+const BEADS = C.beads.flatMap((at, i) => Array.from({ length: 6 }, (_, k) => {
+  const r = mulberry32(i * 97 + k * 7 + 5);
+  return { at: at + r() * 0.12, x: 110 + r() * 860, y: 800 + r() * 250, rad: 6 + r() * 7 };
+}));
+const WATER = Array.from({ length: 46 }, (_, i) => { const r = mulberry32(i * 31 + 2); return { ph: r(), y: 770 + r() * 330, sp: 0.7 + r() * 0.8, len: 60 + r() * 200 }; });
+function panel(g, t, scan) {
+  g.save();
+  // Painted door body, so the panel reads as a solid surface.
+  const body = new Path2D();
+  body.moveTo(60, 800); body.quadraticCurveTo(540, 752, 1020, 782); body.lineTo(1020, 1092); body.lineTo(60, 1098); body.closePath();
+  const pg = g.createLinearGradient(0, 760, 0, 1100);
+  pg.addColorStop(0, rgba('#0c3b55', 0.9 * scan)); pg.addColorStop(0.5, rgba('#02112c', 0.95 * scan)); pg.addColorStop(1, rgba('#000e19', 0.95 * scan));
+  g.fillStyle = pg; g.fill(body);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.strokeStyle = WHITE; g.lineWidth = 3; g.shadowColor = rgba(TURQ_GLOW, 0.9); g.shadowBlur = 14;
+  g.setLineDash([2600 * scan, 2600]);
+  g.beginPath();
+  g.moveTo(60, 800); g.quadraticCurveTo(540, 752, 1020, 782);          // belt line
+  g.moveTo(560, 792); g.quadraticCurveTo(572, 950, 576, 1098);          // door seam
+  g.moveTo(60, 968); g.quadraticCurveTo(540, 900, 1020, 936);           // character line
+  g.moveTo(60, 1098); g.lineTo(1020, 1092);                            // sill
+  g.moveTo(700, 890); g.lineTo(812, 890); g.arc(812, 907, 17, -Math.PI / 2, Math.PI / 2); g.lineTo(700, 924); g.arc(700, 907, 17, Math.PI / 2, Math.PI * 1.5);
+  g.stroke();
+  g.restore();
+}
+function shot2(ctx, t) {
+  const scan = E.expoOut(prog(t, 4.0, 4.75));
+  withReflection(ctx, H2, (g) => {
+    panel(g, t, scan);
+    // Pressure-washer water racing across the panel.
+    const wv = prog(t, 4.3, 4.8) * (1 - prog(t, C.whip1[0] + 0.2, C.whip1[1]));
+    g.save(); g.globalCompositeOperation = 'lighter'; g.lineCap = 'round';
+    for (const w of WATER) {
+      const x = W + 300 - frac(w.ph + (t - 4) * 1.7 * w.sp) * (W + 600);
+      g.strokeStyle = rgba(ICE, 0.55 * wv); g.lineWidth = 1.6;
+      g.beginPath(); g.moveTo(x, w.y); g.lineTo(x + w.len, w.y - w.len * 0.18); g.stroke();
+    }
+    // Foam band sweeping behind.
+    const fb = prog(t, C.lavado - 0.2, C.lavado + 0.4) * (1 - prog(t, C.whip1[0], C.whip1[1]));
+    for (let i = 0; i < 34; i++) {
+      const r = mulberry32(i * 13 + 1);
+      const x = W + 200 - frac(r() + (t - 4) * 0.35) * (W + 400), y = 1040 + (r() - 0.5) * 70, rad = 22 + r() * 40;
+      const gr = g.createRadialGradient(x, y, 0, x, y, rad);
+      gr.addColorStop(0, rgba(WHITE, 0.22 * fb)); gr.addColorStop(1, rgba(WHITE, 0));
+      g.fillStyle = gr; g.beginPath(); g.arc(x, y, rad, 0, TAU); g.fill();
+    }
+    // Beads form on the beats and run down.
+    for (const bd of BEADS) {
+      const dt = t - bd.at;
+      if (dt < 0) continue;
+      const pop = E.expoOut(clamp(dt / 0.2));
+      const fall = dt > 0.3 ? 0.5 * 900 * (dt - 0.3) * (dt - 0.3) : 0;
+      const y = bd.y + Math.min(fall, 1084 - bd.y - bd.rad);
+      g.strokeStyle = rgba(ICE2, 0.5); g.lineWidth = 1.2;
+      if (fall > 2) { g.beginPath(); g.moveTo(bd.x, bd.y); g.lineTo(bd.x, y - bd.rad); g.stroke(); }
+      droplet(g, bd.x, y, bd.rad * pop);
+    }
+    g.restore();
+  });
+  const size = fit('LAVADO', 900, 170, 'bold', 0.04);
+  lightText(ctx, t, 'LAVADO', 540, 600, size, { tIn: C.lavado, tOut: C.whip1[0] });
+  lightText(ctx, t, '01 — LAVADO DE AUTOMÓVILES', 540, 690, 34, { kind: 'ui', tIn: C.lavado_label, tOut: C.whip1[0] + 0.05, color: ICE2, glow: false, track: 0.12, build: 0.3, slices: 3 });
+}
+
+// ---- shot 3: BRILLADO (8-11.33) ---------------------------------------------------------------------------
+function shot3(ctx, t) {
+  const orbit = prog(t, 8, 11.33);
+  const peakX = lerp(500, 620, orbit), peakY = 900;
+  const crest = (x) => { // quadratic through (-60,1180), (peakX, peakY), (W+60, 1180)
+    const u = (x - peakX) / (x < peakX ? peakX + 60 : W + 60 - peakX);
+    return peakY + (1180 - peakY) * u * u;
+  };
+  const hoodPath = (g) => {
+    g.beginPath(); g.moveTo(-60, 1180);
+    for (let x = -60; x <= W + 60; x += 20) g.lineTo(x, crest(x));
+    g.lineTo(W + 60, 1640); g.lineTo(-60, 1640); g.closePath();
+  };
+  // Paint.
+  const pg = ctx.createLinearGradient(0, peakY, 0, 1640);
+  pg.addColorStop(0, '#08162f'); pg.addColorStop(0.35, '#01041d'); pg.addColorStop(1, VOID);
+  ctx.fillStyle = pg; hoodPath(ctx); ctx.fill();
+  ctx.save(); hoodPath(ctx); ctx.clip();
+  // The streaks above, mirrored and bent along the curvature.
+  const f = field(t);
+  ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round';
+  for (let i = 0; i < 42; i++) {
+    const r = mulberry32(i * 53 + 9);
+    const d = 18 + Math.pow(r(), 1.4) * 520;
+    const x0 = W + 400 - frac(r() + f.travel * 0.55 * (0.6 + r() * 0.8)) * (W + 900);
+    const len = 140 + r() * 380;
+    ctx.strokeStyle = rgba(ICE, (0.18 + r() * 0.35) * (1 - d / 600)); ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    for (let k = 0; k <= 6; k++) { const x = x0 + (len * k) / 6; const y = crest(x) + d * (1 + 0.15 * Math.abs(x - peakX) / 500); k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
+  }
+  // The light bar glides over the paint and crosses the crest on the "ting".
+  const bx = 540 + (t - C.crest) * 560;
+  const bar = ctx.createLinearGradient(bx - 110, 0, bx + 110, 0);
+  bar.addColorStop(0, rgba(WHITE, 0)); bar.addColorStop(0.5, rgba(WHITE, 0.55)); bar.addColorStop(1, rgba(WHITE, 0));
+  ctx.setTransform(1, 0, -0.32, 1, 0.32 * 1100, 0);
+  ctx.fillStyle = bar; ctx.fillRect(bx - 110, peakY - 20, 220, 760);
+  ctx.restore();
+  // Crest edge and its specular hot spot.
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = rgba(ICE, 0.7); ctx.lineWidth = 2; ctx.shadowColor = rgba(TURQ_GLOW, 0.8); ctx.shadowBlur = 10;
+  ctx.beginPath(); for (let x = -60; x <= W + 60; x += 20) (x === -60 ? ctx.moveTo(x, crest(x)) : ctx.lineTo(x, crest(x))); ctx.stroke();
+  const hx = bx + (crest(bx) - peakY) * 0.32, hot = Math.exp(-Math.pow((t - C.crest) / 0.18, 2));
+  const hg = ctx.createRadialGradient(hx, crest(hx), 0, hx, crest(hx), 160);
+  hg.addColorStop(0, rgba(WHITE, 0.25 + 0.75 * hot)); hg.addColorStop(1, rgba(WHITE, 0));
+  ctx.fillStyle = hg; ctx.fillRect(hx - 160, crest(hx) - 160, 320, 320);
+  ctx.restore();
+  const size = fit('BRILLADO', 900, 170, 'bold', 0.04);
+  lightText(ctx, t, 'BRILLADO', 540, 600, size, { tIn: C.brillado, tOut: C.whip2[0] });
+  lightText(ctx, t, '02 — BRILLADO', 540, 690, 34, { kind: 'ui', tIn: C.brillado_label, tOut: C.whip2[0] + 0.05, color: ICE2, glow: false, track: 0.12, build: 0.3, slices: 3 });
+}
+
+// ---- shot 4: POLICHADO (11.33-14.67) ------------------------------------------------------------------------
+const SCRATCHES = Array.from({ length: 150 }, (_, i) => {
+  const r = mulberry32(i * 211 + 3);
+  return { x: 110 + r() * 860, y: 830 + r() * 700, rad: 18 + r() * 110, a0: r() * TAU, span: 0.3 + r() * 1.1 };
+});
+const PANEL4 = [90, 800, 900, 760];
+const padFront = (t) => lerp(20, 1080, E.cubicInOut(prog(t, 11.5, 14.3)));
+const padAt = (t) => { const w = (TAU / C.beat) * t; return [padFront(t) + 46 * Math.cos(w), 1180 + 46 * Math.sin(w)]; };
+function shot4(ctx, t) {
+  const zoom = 1 + 0.07 * prog(t, 11.33, 14.67);
+  ctx.save();
+  ctx.translate(540, 1180); ctx.scale(zoom, zoom); ctx.translate(-540, -1180);
+  const [px, py, pw, ph] = PANEL4;
+  const rr = (g) => { g.beginPath(); g.roundRect(px, py, pw, ph, 44); };
+  const pg = ctx.createLinearGradient(0, py, 0, py + ph);
+  pg.addColorStop(0, '#08162f'); pg.addColorStop(1, '#01041d');
+  ctx.fillStyle = pg; rr(ctx); ctx.fill();
+  const front = padFront(t);
+  ctx.save(); rr(ctx); ctx.clip();
+  // Polished side: a true mirror of the streaks above.
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, front, H); ctx.clip();
+  drawStreaks(ctx, t, { flipY: 1180, gain: 0.8 });
+  ctx.restore();
+  // Unpolished side: haze and swirl marks.
+  ctx.fillStyle = rgba('#96c7dc', 0.05); ctx.fillRect(front, py, W, ph);
+  ctx.strokeStyle = rgba('#9fb4c6', 0.33); ctx.lineWidth = 1;
+  for (const s of SCRATCHES) {
+    if (s.x < front - 30) continue;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.rad, s.a0, s.a0 + s.span); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle = rgba(ICE, 0.6); ctx.lineWidth = 2; rr(ctx); ctx.stroke();
+  // The pad and its circular light trails.
+  if (t > 11.4 && t < 14.5) {
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    for (let k = 14; k >= 1; k--) {
+      const [x, y] = padAt(t - k * 0.035);
+      ctx.strokeStyle = rgba(k < 4 ? WHITE : TURQ_GLOW, 0.5 * (1 - k / 15)); ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(x, y, 150, 0, TAU); ctx.stroke();
+    }
+    const [x, y] = padAt(t);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = rgba('#0b1626', 0.92); ctx.beginPath(); ctx.arc(x, y, 146, 0, TAU); ctx.fill();
+    ctx.strokeStyle = WHITE; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, 146, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = rgba(ICE2, 0.7); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 34, 0, TAU); ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+  const size = fit('POLICHADO', 900, 170, 'bold', 0.04);
+  lightText(ctx, t, 'POLICHADO', 540, 600, size, { tIn: C.polichado, tOut: C.whip3[0] });
+  lightText(ctx, t, '03 — POLICHADO', 540, 690, 34, { kind: 'ui', tIn: C.polichado_label, tOut: C.whip3[0] + 0.05, color: ICE2, glow: false, track: 0.12, build: 0.3, slices: 3 });
+}
+
+// ---- shot 5: POLARIZADOS (14.67-18) -------------------------------------------------------------------------
+const H5 = 1250;
+function windowPath(g) {
+  g.beginPath();
+  g.moveTo(120, 1190); g.lineTo(960, 1190); g.lineTo(960, 860);
+  g.quadraticCurveTo(940, 790, 800, 780); g.lineTo(330, 780);
+  g.quadraticCurveTo(170, 800, 120, 930); g.closePath();
+}
+function shot5(ctx, t) {
+  const edge = lerp(-160, 1140, E.cubicInOut(prog(t, C.tint[0], C.tint[1])));
+  withReflection(ctx, H5, (g) => {
+    g.save(); windowPath(g); g.clip();
+    g.fillStyle = rgba('#0c3b55', 0.18); g.fillRect(0, 0, W, H);
+    // The street racing past behind the glass.
+    g.save(); g.globalCompositeOperation = 'lighter'; g.lineCap = 'round';
+    for (let i = 0; i < 38; i++) {
+      const r = mulberry32(i * 71 + 4);
+      const y = 790 + r() * 390, len = 120 + r() * 360;
+      const x = W + 400 - frac(r() + (t - 14) * (0.3 + 0.35 * r())) * (W + 900);
+      g.strokeStyle = rgba(r() > 0.7 ? WHITE : ICE, 0.7 + r() * 0.3); g.lineWidth = 2 + r() * 2;
+      g.beginPath(); g.moveTo(x, y); g.lineTo(x + len, y); g.stroke();
+    }
+    g.restore();
+    // Tint film: everything behind it drops to deep navy.
+    const tg = g.createLinearGradient(edge - 90, 0, edge, 0);
+    tg.addColorStop(0, rgba(HOLD_BOT, 0.72)); tg.addColorStop(1, rgba(HOLD_BOT, 0));
+    g.fillStyle = rgba(HOLD_BOT, 0.72); g.fillRect(0, 0, Math.max(0, edge - 90), H);
+    g.fillStyle = tg; g.fillRect(edge - 90, 0, 90, H);
+    g.globalCompositeOperation = 'lighter';
+    g.fillStyle = rgba(ICE, 0.55); g.fillRect(edge - 2, 0, 3, H);
+    // Glass sheen.
+    for (let i = 0; i < 3; i++) {
+      const sx = 1100 - frac(0.3 * i + (t - 14.6) * 0.45) * 1500;
+      const sg = g.createLinearGradient(sx, 0, sx + 140, 0);
+      sg.addColorStop(0, rgba(WHITE, 0)); sg.addColorStop(0.5, rgba(WHITE, 0.08)); sg.addColorStop(1, rgba(WHITE, 0));
+      g.setTransform(1, 0, -0.5, 1, 0.5 * 980, 0); g.fillStyle = sg; g.fillRect(sx, 760, 140, 450); g.setTransform(1, 0, 0, 1, 0, 0);
+    }
+    g.restore();
+    g.save(); g.strokeStyle = WHITE; g.lineWidth = 3; g.shadowColor = rgba(TURQ_GLOW, 0.9); g.shadowBlur = 14;
+    windowPath(g); g.stroke(); g.restore();
+  });
+  const size = fit('POLARIZADOS', 940, 170, 'bold', 0.04);
+  lightText(ctx, t, 'POLARIZADOS', 540, 600, size, { tIn: C.polarizados, tOut: C.smear[0] });
+  lightText(ctx, t, '04 — POLARIZADOS', 540, 690, 34, { kind: 'ui', tIn: C.polarizados_label, tOut: C.smear[0] + 0.05, color: ICE2, glow: false, track: 0.12, build: 0.3, slices: 3 });
+}
+
+// ---- shot 6: build (18-20) ---------------------------------------------------------------------------------
+function shot6(ctx, t) {
+  const size = fit('Y MÁS.', 900, 190, 'bold', 0.04);
+  lightText(ctx, t, 'Y MÁS.', 540, 720, size, { tIn: C.ymas, color: TURQ });
+}
+function whiteout(t) { // luma curve copied from the reference: 0.9 s ease-in build, peak, 0.55 s settle
+  if (t < 18.9 || t > 20.75) return 0;
+  return t <= C.peak ? Math.pow(prog(t, 18.9, C.peak), 2.6) : 1 - E.expoOut(prog(t, C.peak + 0.05, 20.75));
+}
+
+// ---- shot 7: lockup (20-25) ---------------------------------------------------------------------------------
+function shot7(ctx, t) {
+  // Floor glow draining away under the mark.
+  const fg = 1 - prog(t, C.wordmark[1], 22.0);
+  if (fg > 0) {
+    const g = ctx.createRadialGradient(540, 1520, 0, 540, 1520, 620);
+    g.addColorStop(0, rgba(ICE, 0.32 * fg)); g.addColorStop(1, rgba(ICE, 0));
+    ctx.save(); ctx.translate(540, 1520); ctx.scale(1, 0.28); ctx.translate(-540, -1520);
+    ctx.fillStyle = g; ctx.fillRect(-100, 900, W + 200, 1240); ctx.restore();
+  }
+  const size = fit('QUILLAMI', 940, 190, 'bold', 0.04);
+  lightText(ctx, t, 'QUILLAMI', 540, 700, size, { tIn: C.wordmark[1], build: 0.6, color: TURQ, glow: rgba(TURQ_GLOW, 0.8), slices: 9 });
+  lightText(ctx, t, 'CAR WASH', 540, 800, 54, { kind: 'light', tIn: C.carwash, track: 0.25, color: WHITE, build: 0.4, slices: 4 });
+  lightText(ctx, t, 'ESCRÍBENOS POR WHATSAPP', 540, 1040, 36, { kind: 'ui', tIn: C.whatsapp, track: 0.12, color: ICE2, glow: false, build: 0.35, slices: 3 });
+  lightText(ctx, t, '311 770 1411', 540, 1150, fit('311 770 1411', 820, 96, 'light', 0.02), { kind: 'light', tIn: C.phone, track: 0.02, color: WHITE, build: 0.4, slices: 5 });
+  lightText(ctx, t, '@quillamicarwash', 540, 1235, 40, { kind: 'ui', tIn: C.handle, track: 0.06, color: TURQ, glow: rgba(TURQ_GLOW, 0.6), build: 0.35, slices: 3 });
+}
+
+// ---- timeline -------------------------------------------------------------------------------------------------
+// Shots are joined by whips: the outgoing subject accelerates off left, the incoming one decelerates in from the right.
+const SHOTS = [shot1, shot2, shot3, shot4, shot5, shot6, shot7];
+const WHIP_OF = { 2: C.whip1, 3: C.whip2, 4: C.whip3 };
+function shotIndex(t) { let k = 0; C.shots.forEach((s, i) => { if (t >= s) k = i; }); return k; }
+function drawShot(ctx, t, k) {
+  const whip = WHIP_OF[k + 1], into = WHIP_OF[k];
+  let dx = 0;
+  if (whip && t >= whip[0]) dx = -E.expoIn(prog(t, whip[0], C.shots[k + 1])) * W * 1.3;
+  if (into && t < C.shots[k] + 0.4) dx = (1 - E.expoOut(prog(t, C.shots[k], C.shots[k] + 0.4))) * W * 1.3;
+  ctx.save(); ctx.translate(dx, 0); SHOTS[k](ctx, t); ctx.restore();
+}
+function draw(ctx, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
+  background(ctx, t);
+  drawStreaks(ctx, t);
+  const k = shotIndex(t);
+  drawShot(ctx, t, k);
+  const w = whiteout(t);
+  if (w > 0) {
+    const g = ctx.createRadialGradient(540, 700, 0, 540, 700, 1500);
+    g.addColorStop(0, rgba(WHITE, w)); g.addColorStop(0.45, rgba('#aae5f9', w * 0.92)); g.addColorStop(1, rgba('#59d4f3', w * 0.78));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const acc = document.createElement('canvas'); acc.width = W; acc.height = H;
+const actx = acc.getContext('2d');
+const BLOOM = document.createElement('canvas'); BLOOM.width = W / 4; BLOOM.height = H / 4;
+const bctx = BLOOM.getContext('2d');
+const SHUTTER = 1 / 60;
+const SAMPLES = window.RENDER ? 5 : 1;
+window.seek = function (t) {
+  if (SAMPLES === 1) draw(ctx, t);
+  else {
+    for (let i = 0; i < SAMPLES; i++) {
+      // Whips happen inside shots, so the shutter only has to respect the start of the film.
+      draw(actx, Math.max(0, t - SHUTTER * (1 - i / (SAMPLES - 1))));
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1 / (i + 1);
+      ctx.drawImage(acc, 0, 0);
+    }
+  }
+  // Bloom: a blurred quarter-size copy added back on top (halation around every light).
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+  bctx.setTransform(1, 0, 0, 1, 0, 0); bctx.filter = 'blur(5px)';
+  bctx.clearRect(0, 0, W / 4, H / 4); bctx.drawImage(canvas, 0, 0, W / 4, H / 4);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.32; ctx.drawImage(BLOOM, 0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+};
+window.READY = Promise.all([document.fonts.load('800 100px Unb'), document.fonts.load('400 100px Unb'), document.fonts.load('500 30px UI')]);
+if (!window.RENDER) {
+  const audio = new Audio('audio.wav');
+  document.body.addEventListener('click', () => { audio.currentTime = 0; audio.play(); });
+  window.READY.then(() => {
+    const loop = () => { seek(audio.paused ? (performance.now() / 1000) % window.DURATION : audio.currentTime); requestAnimationFrame(loop); };
+    loop();
+  });
+}
+</script>
+</body>
+</html>

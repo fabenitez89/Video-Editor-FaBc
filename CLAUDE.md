@@ -25,7 +25,7 @@
 
 ## Tooling
 - Layout: one folder per film, `films/<name>/index.html`, with optional `audio.wav` and `beats.json` beside it.
-- A film sets `window.DURATION` (seconds) and defines `window.seek(t)`. Render mode sets `window.RENDER = true` before page scripts run.
+- A film sets `window.DURATION` (seconds) and defines `window.seek(t)`; it may set `window.WIDTH` / `window.HEIGHT` for a non-16:9 frame. Render mode sets `window.RENDER = true` before page scripts run.
 - `python3 scripts/beats.py films/<name>/audio.wav` writes `beats.json` (`{ tempo, beats: [seconds…] }`).
 - `node render.mjs films/<name> --sheet` renders the contact sheet (one frame per beat, or one per second without beats.json) to `out/<name>-sheet.png`.
 - `node render.mjs films/<name>` renders `out/<name>.mp4`, muxing `audio.wav` normalized to -14 LUFS when present.

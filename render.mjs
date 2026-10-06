@@ -20,8 +20,8 @@ if (!filmDir) {
 }
 const name = basename(resolve(filmDir));
 const fps = Number(opt('fps', 30));
-const width = Number(opt('width', 1920));
-const height = Number(opt('height', 1080));
+let width = Number(opt('width', 1920));
+let height = Number(opt('height', 1080));
 const at = opt('at', null)?.split(',').map(Number);
 const sheet = flag('sheet') || Boolean(at);
 const out = opt('out', `out/${name}${sheet ? '-sheet.png' : '.mp4'}`);
@@ -57,6 +57,12 @@ const duration = await page.evaluate(() => {
   if (!(window.DURATION > 0)) throw new Error('film must set window.DURATION in seconds');
   return window.DURATION;
 });
+// A film may declare its own frame size (e.g. 9:16) with window.WIDTH / window.HEIGHT.
+const declared = await page.evaluate(() => [window.WIDTH, window.HEIGHT]);
+if (declared[0] > 0 && declared[1] > 0 && !opt('width', null)) {
+  [width, height] = declared;
+  await page.setViewportSize({ width, height });
+}
 
 async function frameAt(t) {
   await page.evaluate((time) => window.seek(time), t);
